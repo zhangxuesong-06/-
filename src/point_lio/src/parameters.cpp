@@ -180,6 +180,9 @@ void readParameters(std::shared_ptr<rclcpp::Node> & nh)
     nh->declare_parameter<int>("preprocess.timestamp_unit", 1);
     nh->get_parameter("preprocess.timestamp_unit", p_pre->time_unit);
 
+    nh->declare_parameter<bool>("preprocess.simulation_snapshot", false);
+    nh->get_parameter("preprocess.simulation_snapshot", p_pre->simulation_snapshot);
+
     nh->declare_parameter<double>("mapping.match_s", 81);
     nh->get_parameter("mapping.match_s", match_s);
 

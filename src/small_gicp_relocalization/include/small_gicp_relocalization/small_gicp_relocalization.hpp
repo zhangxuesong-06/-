@@ -16,6 +16,9 @@
 #define SMALL_GICP_RELOCALIZATION__SMALL_GICP_RELOCALIZATION_HPP_
 
 #include <memory>
+#include <future>
+#include <cstdint>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -86,6 +89,11 @@ private:
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
+
+  // GMK_GICP_BACKGROUND: declared last so destruction joins before other members.
+  std::uint64_t pose_generation_{0};
+  std::uint64_t registration_generation_{0};
+  std::future<std::pair<bool, Eigen::Isometry3d>> registration_future_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };
 

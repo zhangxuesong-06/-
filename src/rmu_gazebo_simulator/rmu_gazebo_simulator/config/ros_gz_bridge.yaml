@@ -12,12 +12,6 @@
   gz_type_name: "ignition.msgs.Model"
   direction: "GZ_TO_ROS"
 
-- ros_topic_name: "/<robot_name>/front_industrial_camera/image"
-  gz_topic_name: "/world/default/model/<robot_name>/link/front_industrial_camera/sensor/front_industrial_camera/image"
-  ros_type_name: "sensor_msgs/msg/Image"
-  gz_type_name: "ignition.msgs.Image"
-  direction: "GZ_TO_ROS"
-
 - ros_topic_name: "/<robot_name>/livox/lidar"
   gz_topic_name: "/world/default/model/<robot_name>/link/front_mid360/sensor/front_mid360_lidar/scan/points"
   ros_type_name: "sensor_msgs/msg/PointCloud2"
@@ -28,10 +22,4 @@
   gz_topic_name: "/world/default/model/<robot_name>/link/front_mid360/sensor/front_mid360_imu/imu"
   ros_type_name: "sensor_msgs/msg/Imu"
   gz_type_name: "ignition.msgs.IMU"
-  direction: "GZ_TO_ROS"
-
-- ros_topic_name: "/<robot_name>/front_industrial_camera/camera_info"
-  gz_topic_name: "/world/default/model/<robot_name>/link/front_industrial_camera/sensor/front_industrial_camera/camera_info"
-  ros_type_name: "sensor_msgs/msg/CameraInfo"
-  gz_type_name: "ignition.msgs.CameraInfo"
   direction: "GZ_TO_ROS"

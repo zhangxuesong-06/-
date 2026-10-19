@@ -422,7 +422,8 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::SharedPtr
   std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
   /*****************************************************************/
 
-  if (pl_orig.points[plsize - 1].time > 0) {
+  // GMK_SNAPSHOT_TIME: zero offsets are valid for a rendered frame.
+  if (simulation_snapshot || pl_orig.points[plsize - 1].time > 0) {
     given_offset_time = true;
   } else {
     given_offset_time = false;

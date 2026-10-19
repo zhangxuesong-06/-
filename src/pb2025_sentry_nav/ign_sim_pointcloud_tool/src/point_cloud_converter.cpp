@@ -32,6 +32,8 @@ PointCloudConverter::PointCloudConverter(const rclcpp::NodeOptions & options)
   pcd_topic_ = this->get_parameter("pcd_topic").as_string();
   n_scan_ = this->get_parameter("n_scan").as_int();
   horizon_scan_ = this->get_parameter("horizon_scan").as_int();
+  scan_period_ = this->declare_parameter<double>("scan_period", 0.1);
+  simulation_snapshot_ = this->declare_parameter<bool>("simulation_snapshot", false);
   ang_bottom_ = this->get_parameter("ang_bottom").as_double();
   ang_res_y_ = this->get_parameter("ang_res_y").as_double();
 
@@ -71,7 +73,10 @@ void PointCloudConverter::lidarHandle(const sensor_msgs::msg::PointCloud2::Share
       continue;
     }
 
-    new_point.time = (point_id % horizon_scan_) * 0.1f / horizon_scan_;
+    // GMK_CONFIGURED_POINT_TIME: float time field is in seconds.
+    // GMK_SNAPSHOT_TIME: GPU rays are rendered at one frame timestamp.
+    new_point.time = simulation_snapshot_ ? 0.0f :
+      static_cast<float>((point_id % horizon_scan_) * scan_period_ / horizon_scan_);
 
     converted_pc->points.push_back(new_point);
   }

@@ -121,6 +121,7 @@ class Preprocess
   int lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
   double blind, det_range;
   bool given_offset_time;
+  bool simulation_snapshot{false};  // GMK_SNAPSHOT_TIME
 
   private:
   void avia_handler(const livox_ros_driver2::msg::CustomMsg::SharedPtr &msg);

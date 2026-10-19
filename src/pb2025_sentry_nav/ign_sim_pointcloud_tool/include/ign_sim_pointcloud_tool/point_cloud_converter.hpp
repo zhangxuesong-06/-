@@ -55,6 +55,8 @@ private:
 
   int n_scan_;
   int horizon_scan_;
+  double scan_period_{0.1};  // GMK_SCAN_PERIOD_PARAMETER
+  bool simulation_snapshot_{false};  // GMK_SNAPSHOT_TIME
   float ang_bottom_;
   float ang_res_y_;
   std::string pcd_topic_;

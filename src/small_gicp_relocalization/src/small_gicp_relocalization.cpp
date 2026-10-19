@@ -142,42 +142,61 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>());
   pcl::fromROSMsg(*msg, *scan);
-  *accumulated_cloud_ += *scan;
+  // Keep only the latest pending cloud; an in-flight worker owns its input.
+  accumulated_cloud_ = std::move(scan);
 }
 
 void SmallGicpRelocalizationNode::performRegistration()
 {
+  // GMK_GICP_BACKGROUND: all mutable ROS state stays on the default callback group.
+  if (registration_future_.valid()) {
+    if (registration_future_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+      return;
+    }
+    try {
+      const auto result = registration_future_.get();
+      if (registration_generation_ != pose_generation_) {
+        RCLCPP_INFO(this->get_logger(), "Discarded GICP result preceding a new initial pose.");
+      } else if (result.first) {
+        result_t_ = previous_result_t_ = result.second;
+      } else {
+        RCLCPP_WARN(this->get_logger(), "GICP did not converge.");
+      }
+    } catch (const std::exception & ex) {
+      RCLCPP_ERROR(this->get_logger(), "GICP worker failed: %s", ex.what());
+    }
+  }
+
   if (accumulated_cloud_->empty()) {
-    RCLCPP_WARN(this->get_logger(), "No accumulated points to process.");
     return;
   }
-
-  source_ = small_gicp::voxelgrid_sampling_omp<
-    pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
-    *accumulated_cloud_, registered_leaf_size_);
-
-  small_gicp::estimate_covariances_omp(*source_, num_neighbors_, num_threads_);
-
-  source_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
-    source_, small_gicp::KdTreeBuilderOMP(num_threads_));
-
-  if (!source_ || !source_tree_) {
-    return;
-  }
-
-  register_->reduction.num_threads = num_threads_;
-  register_->rejector.max_dist_sq = max_dist_sq_;
-  register_->optimizer.max_iterations = 10;
-
-  auto result = register_->align(*target_, *source_, *target_tree_, previous_result_t_);
-
-  if (result.converged) {
-    result_t_ = previous_result_t_ = result.T_target_source;
-  } else {
-    RCLCPP_WARN(this->get_logger(), "GICP did not converge.");
-  }
-
-  accumulated_cloud_->clear();
+  // Ownership is transferred. The subscriber replaces, never mutates, this cloud.
+  const auto cloud = accumulated_cloud_;
+  accumulated_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  const Eigen::Isometry3d guess = previous_result_t_;
+  const rclcpp::Time scan_stamp = last_scan_time_;
+  registration_generation_ = pose_generation_;
+  registration_future_ = std::async(std::launch::async, [this, cloud, guess, scan_stamp]() {
+    const auto start = std::chrono::steady_clock::now();
+    const auto source = small_gicp::voxelgrid_sampling_omp<
+      pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
+      *cloud, registered_leaf_size_);
+    if (!source || source->empty()) {
+      return std::make_pair(false, guess);
+    }
+    small_gicp::estimate_covariances_omp(*source, num_neighbors_, num_threads_);
+    register_->reduction.num_threads = num_threads_;
+    register_->rejector.max_dist_sq = max_dist_sq_;
+    register_->optimizer.max_iterations = 10;
+    const auto result = register_->align(*target_, *source, *target_tree_, guess);
+    const double wall_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - start).count();
+    RCLCPP_INFO(this->get_logger(),
+      "GMK_GICP_WORKER input_points=%zu sampled_points=%zu target_points=%zu wall_s=%.3f converged=%d scan_age_sim_s=%.3f",
+      cloud->size(), source->size(), target_->size(), wall_s, static_cast<int>(result.converged),
+      (this->now() - scan_stamp).seconds());
+    return std::make_pair(static_cast<bool>(result.converged), Eigen::Isometry3d(result.T_target_source));
+  });
 }
 
 void SmallGicpRelocalizationNode::publishTransform()
@@ -227,6 +246,7 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
     Eigen::Isometry3d robot_base_to_odom = tf2::transformToEigen(transform.transform);
     Eigen::Isometry3d map_to_odom = map_to_robot_base * robot_base_to_odom;
 
+    ++pose_generation_;  // Reject any in-flight result using the old initial pose.
     previous_result_t_ = result_t_ = map_to_odom;
   } catch (tf2::TransformException & ex) {
     RCLCPP_WARN(
