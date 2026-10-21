@@ -14,19 +14,23 @@
 
 `src/pb2025_sentry_nav/pb2025_nav_bringup/config/reality/mid360_user_config.json`
 
-当前文件是示例：电脑接收 IP `192.168.1.50`，雷达 IP `192.168.1.119`。必须先根据真实设备更新所有非空 host IP 和 lidar_configs.ip。电脑网卡静态 IP 配置属于系统设置，由用户完成；具体命令在网卡与 IP 确认后提供。
+当前文件对应 GMK 测试连接：电脑接收 IP `192.168.1.50`，雷达 IP `192.168.1.121`。换设备必须根据实际地址更新所有非空 host IP 和 lidar_configs.ip。电脑网卡静态 IP 配置属于系统设置，不能只修改 JSON。
+
+实机 launch 会等待 enp3s0 链路及 JSON 中的接收 IP 就绪，最多 30 秒，再执行雷达驱动；SDK 保持仓库的 1.4.3，日志内部符号与 ROS 隔离。更换有线网卡时同步调整网口助手的 interface 设置。
 
 在当前机器上，完成网络配置后可单独启动驱动，不启动导航或底盘控制：
 
 ```bash
-source /home/frank/beijixiong/scripts/env.sh
-source /home/frank/beijixiong/install/setup.bash
+cd ~/beijixiong  # 替换成实际仓库目录
+source scripts/env.sh
+source install/setup.bash
+python3 "$PB_ROOT/src/pb2025_sentry_nav/pb2025_nav_bringup/launch/gmk_lidar_network_gate.py" -- \
 ros2 run livox_ros_driver2 livox_ros_driver2_node --ros-args \
   -r __ns:=/red_standard_robot1 \
   -p xfer_format:=1 -p multi_topic:=0 -p data_src:=0 \
   -p publish_freq:=20.0 -p output_data_type:=0 \
   -p frame_id:=front_mid360 \
-  -p user_config_path:=/home/frank/beijixiong/src/pb2025_sentry_nav/pb2025_nav_bringup/config/reality/mid360_user_config.json
+  -p user_config_path:="$PB_ROOT/src/pb2025_sentry_nav/pb2025_nav_bringup/config/reality/mid360_user_config.json"
 ```
 
 另一个已加载相同环境的终端依次检查（频率检查用 Ctrl+C 结束）：
@@ -39,6 +43,15 @@ ros2 topic echo /red_standard_robot1/livox/imu --once
 ```
 
 点云类型应为 livox_ros_driver2/msg/CustomMsg，频率接近设置的 20 Hz；IMU 应持续更新且时间戳递增。记录静止状态下的加速度方向和量级。当前驱动 IMU header.frame_id 写死为 livox_frame，点云使用 front_mid360，后续核对 TF 时需要考虑此差异。
+
+也可先停止上面的独立驱动，再运行只启动雷达的接收/退出检查：
+
+```bash
+python3 scripts/verify_lidar_shutdown.py
+```
+
+该脚本使用独立 ROS 域 174，检查 CustomMsg/IMU 接收与四种停止情形，结束后停止驱动；不会启动导航或底盘控制。
+报告和日志位于仓库 `runtime/lidar-verification/`，不提交 Git。短时接收成功不等于标定、频率或定位精度验收。
 
 ## 3. 定位、TF 与实地地图
 

@@ -21,3 +21,6 @@
 | `src/small_gicp_relocalization` | `1df063ee6f67b592e1da47e2a21ded00321c0906` |
 | `third_party/Livox-SDK2` | `08f523c930b2f0ba1e98a6afaa8d7476bf479908` |
 | `third_party/small_gicp` | `2c6c7831bc1f5ada2ee5300027fe7d7aee66827d` |
+
+SDK 仍以上表的 1.4.3 源码为基准，Linux 共享库新增公共 C API 导出表，隔离内部日志符号；
+未降级或引入另一份 SDK。增量改动与验证范围见 `GMK_LIDAR_NETWORK_CHANGES.md`。

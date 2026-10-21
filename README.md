@@ -1,6 +1,6 @@
 # 北极熊哨兵仿真与导航
 
-本仓库包含单 MID360 仿真导航源码：Ubuntu 22.04、ROS 2 Humble、Gazebo Fortress，15 个上游 ROS 仓库和一个简易决策树包，共 30 个 ROS 包，以及 Livox-SDK2 和 small_gicp 源码。仿真导航和决策节点已运行验证；实机尚未验证。
+本仓库包含单 MID360 仿真导航源码：Ubuntu 22.04、ROS 2 Humble、Gazebo Fortress，15 个上游 ROS 仓库和一个简易决策树包，共 30 个 ROS 包，以及 Livox-SDK2 和 small_gicp 源码。仿真导航和决策节点已运行验证；实机雷达收发与驱动退出已在 GMK 做短时验证，整车定位导航仍需验收。
 
 **新机器不能只 `git clone` 就启动：需要安装系统依赖、编译，并单独提供 PCD。** 以下教程从 Ubuntu 22.04 x86_64 桌面环境开始，不依赖原作者的用户名或绝对路径。建议内存至少 16 GB、有可用 OpenGL 图形环境和足够磁盘空间，首次编译并行度设为 2。
 
@@ -119,6 +119,13 @@ ldd /usr/local/lib/libsmall_gicp.so
 
 Livox-SDK2 固定提交为 `08f523c930b2f0ba1e98a6afaa8d7476bf479908`，CHANGELOG 标为 1.4.3，但没有同名正式 tag；不要替换成此前不匹配的 v1.2.5。完整固定版本见 [SOURCE_VERSIONS.md](SOURCE_VERSIONS.md)。
 
+Linux 共享 SDK 只导出公共 C API，内部 spdlog/fmt 符号保持私有，避免与 ROS 日志库混用而在退出时崩溃。
+更新此修复后应重新构建并安装 SDK，再构建 ROS 驱动，不能只复制 launch 文件。安装后检查版本和导出接口：
+
+```bash
+python3 scripts/verify_livox_sdk_exports.py /usr/local/lib/liblivox_lidar_sdk_shared.so
+```
+
 ## 5. 放入 PCD，再编译 ROS 工作区
 
 按仓库拥有者要求，`.gitignore` 排除了所有 PCD，**本仓库不分发点云地图，也没有自动下载地址**。向项目拥有者取得已验证的 `rmuc_2025.pcd`，在构建前放到：
@@ -229,7 +236,7 @@ bash scripts/start_sim_decision.sh mode:=decision hp_source:=referee
 - 单 MID360 仿真：移除 RPLIDAR 实例及对应桥接，保留点云和 IMU。
 - 雷达倒装适配：仿真 MID360 安装在 `gimbal_yaw` 上，姿态绕 X 轴旋转 180 度；定位与点云转换参数使用对应的云台参考系。
 - 点云强度过滤：`pointcloud_to_laserscan` 支持 `min_intensity`/`max_intensity`，仿真配置用高度强度阈值过滤地面点。
-- Livox：已包含 ROS2 package.xml；实机 xfer_format=1；没有应用旧 SDK 兼容补丁。
+- Livox：包含并跟踪 ROS2 package.xml；实机 xfer_format=1；保留 SDK 1.4.3，隔离共享库内部日志符号。
 - 重定位：使用 C++17 和安装的 small_gicp::small_gicp，不再在线拉取 master。
 - 模型：移除 stock joint_state_publisher 不支持的零值 offset_timestamp。
 - 找不到 ROS 包：每个新终端都要 source scripts/env.sh 和 install/setup.bash。
@@ -242,5 +249,8 @@ bash scripts/start_sim_decision.sh mode:=decision hp_source:=referee
 ## 实机范围与许可
 
 实机目标为 NUC13、Ubuntu 22.04 x86、单 MID360；网络、雷达安装外参、底盘 ROS1 到 ROS2 接口与实地地图尚需配置，详见 [HARDWARE_MIGRATION.md](HARDWARE_MIGRATION.md)。实机配置中的 IP 和机器人几何是示例，不能把仿真成功当作实机验收。
+
+GMK 增量部署的无线开机修复单独见 [scripts/gmk_network/README.md](scripts/gmk_network/README.md)，
+不会随 ROS 编译自动应用。迁移范围与验证记录见 [GMK_LIDAR_NETWORK_CHANGES.md](GMK_LIDAR_NETWORK_CHANGES.md)。
 
 各上游项目许可保留在各目录的 LICENSE/NOTICE 中。本仓库不为所有第三方代码重新指定统一许可。构建产物、日志、原 ZIP、PCD 和部署私钥不上传。

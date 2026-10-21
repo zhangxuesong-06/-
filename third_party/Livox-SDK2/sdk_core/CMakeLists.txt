@@ -143,3 +143,12 @@ install(TARGETS ${SDK_LIBRARY_STATIC} ${SDK_LIBRARY_SHARED}
         PUBLIC_HEADER DESTINATION include
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib)
+
+# SDK and ROS may use incompatible spdlog/fmt versions in the same process.
+# Keep all SDK implementation symbols private; retain the unchanged public C API.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_property(TARGET ${SDK_LIBRARY_SHARED} APPEND_STRING PROPERTY LINK_FLAGS
+    " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/livox_sdk_exports.map")
+  set_property(TARGET ${SDK_LIBRARY_SHARED} APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/livox_sdk_exports.map")
+endif()

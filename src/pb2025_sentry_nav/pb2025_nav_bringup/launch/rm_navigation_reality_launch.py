@@ -14,6 +14,8 @@
 
 
 import os
+import shlex
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -162,6 +164,11 @@ def generate_launch_description():
         executable="livox_ros_driver2_node",
         name="livox_ros_driver2",
         output="screen",
+        prefix=[
+            sys.executable + " "
+            + shlex.quote(os.path.join(launch_dir, "gmk_lidar_network_gate.py"))
+            + " -- "
+        ],
         namespace=namespace,
         parameters=[configured_params],
     )
