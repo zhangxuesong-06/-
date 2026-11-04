@@ -1,0 +1,44 @@
+# 依赖（本项目零依赖，但保留常规规则，避免以后加包时把 node_modules 提交上去）
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 运行产物 / 临时文件
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.pid
+*.seed
+coverage/
+.nyc_output/
+
+# 本机状态与令牌（apx 默认写在 ~/.apx，这里防的是手动指到仓库内的情况）
+.apx/
+state.json
+*.local
+
+# 环境变量与凭据（适配器 manifest 里不应出现明文 key；本机凭据文件更不要提交）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+
+# 编辑器 / 操作系统
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Agent 工作区记忆（含本机路径与内部交接笔记；想公开交接记录就删掉这一行）
+.workbuddy/

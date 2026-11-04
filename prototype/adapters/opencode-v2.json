@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "id": "opencode-v2",
+  "name": "OpenCode（v2 服务面）",
+  "level": "official",
+  "maintainer": "apx",
+  "version": "1.0.0",
+  "description": "通过自起 serve 实例拿到确定性端口与凭据，再按 OpenAPI 契约做协议适配",
+  "testedWith": ["2.2.x"],
+  "match": {
+    "exeNames": ["opencode-cli.exe"],
+    "pathGlobs": [
+      "%APPDATA%/ai.opencode.desktop/cli/*/opencode-cli.exe"
+    ],
+    "registryNamePattern": "opencode"
+  },
+  "serviceFace": {
+    "type": "http-openapi",
+    "portDiscovery": {
+      "strategy": "launch-assigned",
+      "argv": ["{exe}", "serve", "--hostname", "{host}", "--port", "{port}"],
+      "cwd": "{installDir}"
+    },
+    "proxyEnv": "clear",
+    "readyProbe": {
+      "path": "/api/model",
+      "timeoutMs": 60000
+    },
+    "auth": {
+      "type": "basic",
+      "username": "opencode",
+      "secretFrom": {
+        "kind": "stdout",
+        "pattern": "server password (\\S+)"
+      }
+    }
+  },
+  "upstream": {
+    "listModels": {
+      "path": "/api/model",
+      "items": "$.data",
+      "fields": { "id": "id", "provider": "providerID", "displayName": "name" }
+    },
+    "generate": {
+      "path": "/api/experimental/generate/text",
+      "body": {
+        "prompt": "${prompt}",
+        "model.id": "${model.upstreamId}",
+        "model.providerID": "${model.provider}"
+      },
+      "textPath": "$.data.text"
+    }
+  },
+  "capabilities": {
+    "streaming": false,
+    "tools": false,
+    "vision": true,
+    "embeddings": false
+  },
+  "sessionPolicy": "stateless",
+  "quirks": {
+    "requiresUserSession": false,
+    "knownIssues": [
+      "首次启动约 15–20 秒插件激活期，其间契约端点返回 503 Location plugins did not finish activating",
+      "鉴权是 HTTP Basic（用户名 opencode + stdout 打印的 password），Bearer 无效",
+      "免费模型的免费额度用尽后返回 429 且 retryAfterMs 可能长达数小时",
+      "serviceFace.proxyEnv 显式声明为 clear：本机开着系统代理时，spawn 出来的上游会把去 127.0.0.1 的请求也交给代理而得到 502 ERR_PROXY_TUNNEL，clear 后正常。显式写出而不是依赖默认值，是为了让行为被声明、不随版本漂移"
+    ]
+  }
+}

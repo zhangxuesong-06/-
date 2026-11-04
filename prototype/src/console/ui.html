@@ -1,0 +1,920 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apx-console-token" content="__APX_CONSOLE_TOKEN__">
+<title>apx 控制台</title>
+<style>
+  :root {
+    --bg: #0d1014;
+    --bg2: #141821;
+    --bg3: #1b2130;
+    --bg4: #232b3b;
+    --fg: #e7ebf3;
+    --fg2: #a7b3c6;
+    --muted: #6f7d93;
+    --line: #28303f;
+    --ok: #4ec97a;
+    --ok-bg: #12301f;
+    --info: #5aa9ff;
+    --warn: #e5b955;
+    --err: #f06a76;
+    --err-bg: #33161a;
+    --radius: 8px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  code, .mono { font-family: var(--mono); font-size: 12px; }
+
+  /* ---------- 顶部 ---------- */
+  header {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 600; letter-spacing: .3px; }
+  .brand span { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .grow { flex: 1 1 auto; }
+  .light { display: flex; align-items: center; gap: 6px; color: var(--fg2); white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 3px rgba(0,0,0,.25); }
+  .light.on .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .light.err .dot { background: var(--err); box-shadow: 0 0 8px var(--err); }
+  .light.on { color: var(--ok); }
+  .light.err { color: var(--err); }
+
+  /* ---------- 结构条：上游 → 代理 → 下游 ---------- */
+  #flow {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: stretch;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--line);
+  }
+  .flow-node {
+    flex: 1 1 0;
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 7px 10px;
+    background: var(--bg3);
+  }
+  .flow-node .tag { display: block; font-size: 11px; color: var(--muted); letter-spacing: .3px; }
+  .flow-node b { display: block; font-size: 13px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .flow-node .sub { display: block; color: var(--fg2); font-size: 11.5px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .flow-node.up { border-color: #2c4a63; }
+  .flow-node.up b { color: #8fc7ff; }
+  .flow-node.mid { border-color: #3a4a2e; }
+  .flow-node.mid.on { border-color: var(--ok); }
+  .flow-node.mid.on b { color: var(--ok); }
+  .flow-node.down { border-color: #4a3f2c; }
+  .flow-node.down b { color: #e8c98a; }
+  .flow-arrow { flex: 0 0 auto; display: flex; align-items: center; color: var(--muted); font-size: 15px; }
+  .muted-sm { color: var(--muted); margin-left: 4px; }
+
+  button {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg3);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 11px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s;
+  }
+  button:hover:not(:disabled) { background: var(--bg4); border-color: #3a465c; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #1d3b2a; border-color: #2c6242; color: #bdf0d0; }
+  button.primary:hover:not(:disabled) { background: #245035; }
+  button.danger { background: #3a1a1e; border-color: #613039; color: #ffc9cf; }
+  button.danger:hover:not(:disabled) { background: #4a2126; }
+  button.tiny { padding: 2px 8px; font-size: 11px; }
+
+  input[type="text"], input[type="number"], select {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 8px;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--info); }
+  label.check { display: inline-flex; align-items: center; gap: 5px; color: var(--fg2); cursor: pointer; white-space: nowrap; }
+
+  /* ---------- 布局 ---------- */
+  main { flex: 1 1 auto; display: grid; grid-template-columns: minmax(300px, 380px) 1fr; min-height: 0; }
+  aside { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; background: var(--bg2); }
+  .pane-head {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-bottom: 1px solid var(--line);
+    color: var(--fg2); font-size: 12px;
+  }
+  .list { flex: 1 1 auto; overflow-y: auto; }
+  #detail-pane { overflow-y: auto; padding: 0 0 40px; }
+
+  .cand {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 2px 10px;
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(40,48,63,.55);
+    cursor: pointer;
+  }
+  .cand:hover { background: var(--bg3); }
+  .cand.sel { background: #1c2a3d; box-shadow: inset 3px 0 0 var(--info); }
+  .cand .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cand .conf { font-family: var(--mono); font-size: 11px; color: var(--warn); text-align: right; }
+  .cand .meta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; }
+  .cand .run-on { color: var(--ok); }
+  .cand .run-off { color: var(--muted); }
+
+  /* ---------- 详情 ---------- */
+  section.card { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  h2 { font-size: 13px; font-weight: 600; margin: 0 0 10px; color: var(--fg); letter-spacing: .3px; }
+  h2 .sub { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 12px; }
+  dl.kv { display: grid; grid-template-columns: 96px 1fr; gap: 6px 10px; margin: 0; }
+  dl.kv dt { color: var(--muted); font-size: 12px; }
+  dl.kv dd { margin: 0; word-break: break-all; font-family: var(--mono); font-size: 12px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    background: var(--bg3); border: 1px solid var(--line); color: var(--fg2); font-size: 11px;
+  }
+  .chip.mono { font-family: var(--mono); }
+  .chip.hit { background: #132a3a; border-color: #2c5c78; color: #9ed4f5; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 6px; font-weight: 600; font-size: 12px; border: 1px solid transparent; }
+  .lv-L1 { background: #12301f; border-color: #2c6242; color: #8ce8ae; }
+  .lv-L2 { background: #332a12; border-color: #6b5620; color: #f0d589; }
+  .lv-L2.lv-auth { background: #2a2438; border-color: #574a7a; color: #cbb8ff; }
+  .lv-L3 { background: #1a2740; border-color: #2f4c78; color: #9cc4ff; }
+  .lv-L0, .lv-UNKNOWN, .lv-NOT_READY { background: var(--bg3); border-color: var(--line); color: var(--fg2); }
+
+  ul.reasons { margin: 10px 0 0; padding-left: 18px; color: var(--fg2); }
+  ul.reasons li { margin: 3px 0; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; }
+  td.mono, th.mono { font-family: var(--mono); }
+  tr.bad td { color: #d9a3a9; }
+  tr.warn td { color: #f0d589; }
+  tr.good td { color: #a8e6bf; }
+
+  .empty { color: var(--muted); padding: 24px 16px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  /* ---------- 运行横幅 ---------- */
+  #running { display: none; }
+  #running.show { display: block; background: linear-gradient(180deg, #10261a, #0d1912); }
+  #running .banner-line {
+    display: grid; grid-template-columns: 76px minmax(0, 620px) auto;
+    justify-content: start; gap: 10px; align-items: center;
+    padding: 5px 0;
+  }
+  #running .k { color: #7fbe97; font-size: 12px; }
+  #running .v { font-family: var(--mono); font-size: 12px; color: #d6f5e2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #running .stats { color: #7fbe97; font-size: 11px; margin-top: 6px; display: flex; gap: 14px; flex-wrap: wrap; }
+  #model-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 150px; overflow-y: auto; margin-top: 8px; }
+  #model-list .m {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #16261c; border: 1px solid #2b4a35; border-radius: 999px;
+    padding: 1px 4px 1px 9px; font-family: var(--mono); font-size: 11px; color: #c7ecd5;
+  }
+  #model-list .m button { padding: 0 5px; font-size: 11px; background: transparent; border: none; color: #8ec5a2; }
+  #model-list .m button:hover { color: #e7fff0; background: transparent; }
+
+  /* ---------- 错误条 / toast ---------- */
+  #errbar {
+    display: none; padding: 7px 14px; background: var(--err-bg); color: #ffb3ba;
+    border-bottom: 1px solid #5a2a30; font-size: 12px; white-space: pre-wrap;
+  }
+  #errbar.show { display: block; }
+  #toasts { position: fixed; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  .toast {
+    background: var(--bg3); border: 1px solid var(--line); border-left: 3px solid var(--info);
+    padding: 8px 12px; border-radius: 6px; max-width: 420px; box-shadow: 0 6px 20px rgba(0,0,0,.45);
+    font-size: 12px; white-space: pre-wrap;
+  }
+  .toast.err { border-left-color: var(--err); }
+  .toast.ok { border-left-color: var(--ok); }
+  .toast.warn { border-left-color: var(--warn); }
+  .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">apx 控制台<span>本机模型端点</span></div>
+  <button id="btn-rescan">重新扫描</button>
+  <input type="text" id="filter" placeholder="按名称筛选" style="width:150px">
+  <label class="check" title="只显示被某个适配器命中的软件；关闭后可看到全部候选（含系统进程）"><input type="checkbox" id="only-matched" checked> 只看已适配软件<span class="muted-sm" id="matched-count"></span></label>
+  <label class="check"><input type="checkbox" id="show-all"> 显示全部（含低置信）</label>
+  <div class="grow"></div>
+  <div class="light" id="light"><span class="dot"></span><span id="light-text">未运行</span></div>
+</header>
+
+<div id="flow">
+  <div class="flow-node up">
+    <span class="tag">上游 · 提供模型</span>
+    <b id="flow-up">未选择</b>
+    <span class="sub" id="flow-up-sub">谁有模型能力：agent 客户端 / 本地推理服务</span>
+  </div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-node mid" id="flow-mid-node">
+    <span class="tag">中间 · 本机代理（apx）</span>
+    <b id="flow-mid">未启动</b>
+    <span class="sub" id="flow-mid-sub">127.0.0.1:— · 统一翻译成 OpenAI 格式</span>
+  </div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-node down">
+    <span class="tag">下游 · 使用模型</span>
+    <b>你的程序</b>
+    <span class="sub">IDE 插件 / 脚本 / 聊天客户端 / 另一个 agent</span>
+  </div>
+</div>
+
+<div id="errbar"></div>
+
+<main>
+  <aside>
+    <div class="pane-head"><span id="list-count">本机软件 0</span><span class="grow"></span><span id="list-note">置信度 ≥ 0.85</span></div>
+    <div class="list" id="list"><div class="empty">加载中…</div></div>
+  </aside>
+
+  <div id="detail-pane">
+    <section class="card" id="running">
+      <h2>代理运行中<span class="sub" id="r-adapter"></span></h2>
+      <div class="banner-line"><span class="k">baseURL</span><span class="v" id="r-base"></span><button class="tiny" data-copy="r-base">复制</button></div>
+      <div class="banner-line"><span class="k">apiKey</span><span class="v" id="r-key"></span><button class="tiny" data-copy="r-key">复制</button></div>
+      <div class="banner-line"><span class="k">model</span><span class="v" id="r-model"></span><button class="tiny" data-copy="r-model">复制</button></div>
+      <div class="stats" id="r-stats"></div>
+      <div class="hint">下游可调用 <code>POST /v1/chat/completions</code> 或 <code>POST /v1/responses</code>；未实现的接口会明确返回 501，不会静默忽略。</div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="model-search" placeholder="搜索模型" style="width:180px">
+        <span class="hint" id="model-count"></span>
+        <div class="grow"></div>
+        <button class="danger" id="btn-stop">停止</button>
+      </div>
+      <div id="model-list"></div>
+    </section>
+
+    <section class="card" id="detail">
+      <div class="empty">从左侧选择一个候选软件，或直接在下方选择提供方并启动。</div>
+    </section>
+
+    <section class="card" id="adapter-card">
+      <h2>选择提供方软件<span class="sub" id="adapter-sub"></span></h2>
+      <div class="hint" id="adapter-provider" style="margin-bottom:8px; color:var(--fg)"></div>
+      <div class="hint" style="margin-bottom:8px">
+        <b>提供方</b>是真正出模型回答的本机软件或服务；<b>适配器</b>是 apx 连接它所需的说明书：去哪找、如何鉴权、调用哪个接口、如何转成 OpenAI 格式。<br>
+        点左侧候选软件会自动切到对应适配器；端口扫描型不绑定某个软件，会连接它探到的本机服务。<br>
+        新增同类软件通常只需在 <code>prototype/adapters/</code> 放一份 JSON；遇到新协议则还需要对应的转换代码。
+      </div>
+      <div class="row">
+        <label for="adapter-select" class="hint" style="margin:0">提供方软件 / 接入方式</label>
+        <select id="adapter-select" style="min-width:280px"></select>
+        <span id="port-wrap" style="display:none">
+          <input type="number" id="upstream-port" placeholder="上游端口" style="width:110px">
+        </span>
+        <button class="primary" id="btn-start">启动代理</button>
+        <span class="spinner" id="start-spin" style="display:none"></span>
+      </div>
+      <div class="hint" id="adapter-hint"></div>
+      <div class="hint" id="adapter-meta"></div>
+    </section>
+  </div>
+</main>
+
+<div id="toasts"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  const TOKEN = (document.querySelector('meta[name="apx-console-token"]') || {}).content || '';
+  const $ = (sel) => document.querySelector(sel);
+
+  const S = {
+    candidates: [],
+    adapters: [],
+    selectedId: null,
+    probe: null,
+    probeBusy: false,
+    status: null,
+    snippet: null,
+    onlyMatched: true,
+    scanTotal: 0,
+    matchedTotal: 0,
+    showAll: false,
+    query: '',
+    adapterId: '',
+    upstreamPort: '',
+    modelQuery: '',
+    light: 'off',
+    lastError: '',
+  };
+
+  const LEVEL_TEXT = {
+    L1: '可直接接入', L2: '需适配 / 兜底页', L3: '仅 CLI 包装',
+    L0: '不可代理', UNKNOWN: '未知', NOT_READY: '未运行', EXCLUDED: '已排除',
+  };
+
+  // ---------- 基础工具 ----------
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function toast(msg, kind) {
+    const box = document.createElement('div');
+    box.className = 'toast ' + (kind || '');
+    box.textContent = msg;
+    $('#toasts').appendChild(box);
+    setTimeout(() => box.remove(), kind === 'err' ? 12000 : 5000);
+  }
+
+  function showError(msg) {
+    S.lastError = msg || '';
+    const bar = $('#errbar');
+    if (!msg) { bar.classList.remove('show'); bar.textContent = ''; return; }
+    bar.textContent = '⚠ ' + msg;
+    bar.classList.add('show');
+  }
+
+  function setLight(kind, text) {
+    S.light = kind;
+    const n = $('#light');
+    n.className = 'light' + (kind === 'on' ? ' on' : kind === 'err' ? ' err' : '');
+    $('#light-text').textContent = text || (kind === 'on' ? '运行中' : kind === 'err' ? '异常' : '未运行');
+  }
+
+  async function api(path, opts) {
+    const options = Object.assign({ method: 'GET' }, opts || {});
+    const headers = Object.assign({ 'x-apx-console-token': TOKEN }, options.headers || {});
+    if (options.body) headers['content-type'] = 'application/json';
+    const res = await fetch(path, Object.assign({}, options, { headers }));
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (_) { /* 非 JSON */ }
+    if (!res.ok) {
+      const msg = (json && json.error && json.error.message) || ('接口返回 HTTP ' + res.status + ' ' + (text || '').slice(0, 160));
+      throw new Error(msg);
+    }
+    return json;
+  }
+
+  async function copyText(text, label) {
+    const value = String(text == null ? '' : text);
+    if (!value) { toast('没有可复制的内容', 'warn'); return; }
+    try {
+      if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(value);
+      else legacyCopy(value);
+      toast('已复制 ' + (label || '') , 'ok');
+    } catch (e) {
+      try { legacyCopy(value); toast('已复制 ' + (label || ''), 'ok'); }
+      catch (e2) { toast('复制失败：' + (e2.message || e.message), 'err'); }
+    }
+  }
+
+  function legacyCopy(value) {
+    const ta = document.createElement('textarea');
+    ta.value = value;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand && document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (!ok) throw new Error('execCommand copy 返回 false');
+  }
+
+  // ---------- 候选列表 ----------
+  function visibleCandidates() {
+    const q = S.query.trim().toLowerCase();
+    return S.candidates.filter((c) => {
+      // 默认只看"被某个适配器命中"的软件：否则首屏全是 conhost/Explorer 这类系统进程
+      if (S.onlyMatched && !(c.matchedBy && c.matchedBy.length)) return false;
+      if (!S.showAll && c.confidence < 0.85) return false;
+      if (q && !(c.name || '').toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }
+
+  function renderList() {
+    const all = S.candidates.length;
+    const shown = visibleCandidates();
+    $('#list-count').textContent = '本机软件 ' + shown.length + ' / ' + all;
+    $('#matched-count').textContent = '（' + S.matchedTotal + ' / ' + all + '）';
+    $('#list-note').textContent = S.onlyMatched
+      ? '只看已适配（' + S.matchedTotal + '）'
+      : S.showAll
+        ? '显示全部'
+        : '置信度 ≥ 0.85';
+
+    if (!all) {
+      $('#list').innerHTML = '<div class="empty">没有扫描到候选。点「重新扫描」重试。</div>';
+      return;
+    }
+    if (!shown.length) {
+      // 空态必须给出下一步动作：默认视图是"只看已适配"，没装任何已适配软件时这里会空，
+      // 但用户仍然可以直接用下方适配器启动（port-scan / remote 型不需要候选）。
+      if (S.onlyMatched && !S.query.trim()) {
+        $('#list').innerHTML =
+          '<div class="empty">未检测到已适配软件。<br><br>' +
+          '可直接从<b>下方</b>选择提供方并启动（如「本机 OpenAI 兼容推理服务」会自动探测 11434 等端口），<b>无需</b>先选上面的软件。<br><br>' +
+          '<b>为什么这么少？</b>这里只列出“有适配器且被识别到”的软件；其余 ' + (all - S.matchedTotal) + ' 个候选只是发现了安装或进程，不代表已经知道如何连接。<br><br>' +
+          '也可以关闭上方「只看已适配软件」开关，查看全部 ' + all + ' 个候选（其中大部分是系统进程）。</div>';
+        return;
+      }
+      $('#list').innerHTML = '<div class="empty">当前筛选条件下没有候选。可以放宽筛选或勾选「显示全部」。</div>';
+      return;
+    }
+
+    $('#list').innerHTML = shown.map((c) => {
+      const ports = (c.ports || []).map((p) => p.port).join(',') || '无端口';
+      const sel = c.id === S.selectedId ? ' sel' : '';
+      const matched = (c.matchedBy || []).map((id) => '<span class="chip hit">' + esc(id) + '</span>').join('');
+      return '<div class="cand' + sel + '" data-id="' + esc(c.id) + '">' +
+        '<div class="name">' + esc(c.name || '(未命名)') + '</div>' +
+        '<div class="conf">' + Number(c.confidence || 0).toFixed(2) + '</div>' +
+        '<div class="meta">' +
+          '<span class="' + (c.running ? 'run-on' : 'run-off') + '">' + (c.running ? '● 运行' : '○ 停止') + '</span>' +
+          '<span>v' + esc(c.version || '-') + '</span>' +
+          '<span class="mono">' + esc(ports) + '</span>' +
+          matched +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    Array.from($('#list').querySelectorAll('.cand')).forEach((node) => {
+      node.addEventListener('click', () => selectCandidate(node.getAttribute('data-id')));
+    });
+  }
+
+  function selectCandidate(id) {
+    if (!id) return;
+    S.selectedId = id;
+    const c = S.candidates.find((x) => x.id === id);
+    const matched = (c?.matchedBy || []).filter(Boolean);
+    // 关键交互：点左侧软件 = 选中这个提供方；适配器跟着切到它对应的说明书。
+    // 否则用户点了 DeepSeek/OpenCode，下面还停在「自动端口扫描」，自然会以为"点不了/代理不了"。
+    if (matched.length && !matched.includes(S.adapterId)) {
+      S.adapterId = matched[0];
+      renderAdapterOptions();
+    }
+    S.probe = null;
+    renderList();
+    renderDetail();
+    renderFlow();
+  }
+
+  function selectedCandidate() {
+    return S.candidates.find((c) => c.id === S.selectedId) || null;
+  }
+
+  function portsOf(c) {
+    return ((c && c.ports) || []).filter((p) => p && p.port).map((p) => p.port);
+  }
+
+  // ---------- 详情 ----------
+  function renderDetail() {
+    const c = selectedCandidate();
+    if (!c) {
+      $('#detail').innerHTML = '<div class="empty">从左侧选择一个候选软件，或直接在下方选择提供方并启动。</div>';
+      return;
+    }
+    const ports = portsOf(c);
+    const portChips = ports.length
+      ? ports.map((p) => '<button class="chip mono" data-probe="' + p + '">' + p + '</button>').join('')
+      : '<span class="chip">无监听端口</span>';
+    const matched = (c.matchedBy || []).filter(Boolean);
+    const matchedNames = matched.map((id) => {
+      const a = S.adapters.find((x) => x.id === id);
+      return a ? (a.name || id) : id;
+    });
+    const proxyWay = matchedNames.length
+      ? '可代理：' + esc(matchedNames.join('、')) + '（已自动选到下方）'
+      : '暂无匹配适配器；仍可用下方「自动端口扫描」或「手动端口」接入';
+    const providerHint = matchedNames.length
+      ? '这个软件就是提供方；点下方「启动代理」会通过它的适配器接入。'
+      : '这个软件还没写适配器，所以不能一键代理；可以先用通用端口接入。';
+
+    $('#detail').innerHTML =
+      '<h2>' + esc(c.name || '(未命名)') + '<span class="sub">置信度 ' + Number(c.confidence || 0).toFixed(2) + ' · ' + (c.running ? '运行中' : '未运行') + '</span></h2>' +
+      '<dl class="kv">' +
+        '<dt>exe 路径</dt><dd>' + esc(c.exePath || '未定位') + '</dd>' +
+        '<dt>安装位置</dt><dd>' + esc(c.installLocation || '-') + '</dd>' +
+        '<dt>版本</dt><dd>' + esc(c.version || '-') + '</dd>' +
+        '<dt>来源标签</dt><dd><span class="chips">' + ((c.sources || []).map((s) => '<span class="chip">' + esc(s) + '</span>').join('') || '<span class="chip">-</span>') + '</span></dd>' +
+        '<dt>监听端口</dt><dd><span class="chips">' + portChips + '</span></dd>' +
+        '<dt>进程 PID</dt><dd>' + esc((c.pids || []).join(',') || '-') + '</dd>' +
+        '<dt>代理方式</dt><dd>' + proxyWay + '<div class="hint">' + providerHint + '</div></dd>' +
+      '</dl>' +
+      '<div class="row" style="margin-top:12px">' +
+        '<button class="primary" id="btn-probe"' + (ports.length ? '' : ' disabled') + '>探测可代理性</button>' +
+        '<span class="hint">点端口号可以单独探测该端口</span>' +
+      '</div>' +
+      '<div id="probe-result"></div>';
+
+    const btn = $('#btn-probe');
+    if (btn) btn.addEventListener('click', () => runProbe(ports[0]));
+    Array.from($('#detail').querySelectorAll('[data-probe]')).forEach((n) => {
+      n.addEventListener('click', () => runProbe(Number(n.getAttribute('data-probe'))));
+    });
+
+    renderProbe();
+  }
+
+  function renderProbe() {
+    const box = $('#probe-result');
+    if (!box) return;
+    if (S.probeBusy) { box.innerHTML = '<div class="hint"><span class="spinner"></span> 正在探测端口…</div>'; return; }
+    if (!S.probe) { box.innerHTML = ''; return; }
+    const { port, result } = S.probe;
+    if (result.error) { box.innerHTML = '<div class="hint" style="color:var(--err)">探测失败：' + esc(result.error) + '</div>'; return; }
+
+    const ev = result.evidence || {};
+    const root = ev.root;
+    // 401 不是"结构不对"，是"结构对了但没给凭证"—— 这两种要分开说，否则用户会去改适配器结构
+    const needsAuth = result.level === 'L2' && (ev.candidates || []).some((x) => x.status === 401);
+    const levelLabel = needsAuth ? '需凭证（上游要求鉴权）' : LEVEL_TEXT[result.level] || '';
+    const reasons = needsAuth ? ['上游要求鉴权，需适配器提供凭证', ...(result.reasons || [])] : result.reasons || [];
+    const rows = (ev.candidates || []).map((x) => {
+      if (x.ok === false) {
+        return '<tr class="bad"><td class="mono">' + esc(x.path) + '</td><td>—</td><td>不可达</td><td class="mono">' + esc(x.error || '') + '</td><td>—</td><td>—</td></tr>';
+      }
+      const bad = Boolean(x.html || x.sameAsRoot || !x.json);
+      const warn = !bad && !x.modelList;
+      const cls = bad ? 'bad' : warn ? 'warn' : x.modelList ? 'good' : '';
+      const shapeText = x.json ? (x.modelList ? 'JSON · OpenAI 形状' : 'JSON · 非 OpenAI 形状') : '非 JSON';
+      return '<tr class="' + cls + '">' +
+        '<td class="mono">' + esc(x.path) + '</td>' +
+        '<td class="mono">' + esc(x.status) + '</td>' +
+        '<td class="mono">' + esc(x.contentType || '-') + '</td>' +
+        '<td class="mono">' + esc(x.size) + ' B</td>' +
+        '<td title="' + esc(x.shape || '') + '">' + shapeText + (x.html ? ' / HTML' : '') + '</td>' +
+        '<td>' + (x.sameAsRoot ? '与根路径同字节' : '—') + '</td>' +
+      '</tr>';
+    }).join('');
+
+    box.innerHTML =
+      '<div style="margin-top:14px"><span class="badge lv-' + esc(result.level) + (needsAuth ? ' lv-auth' : '') + '">' + esc(result.level) + ' · ' + esc(levelLabel) + '</span>' +
+      '<span class="hint" style="margin-left:10px">端口 ' + esc(port) + '</span></div>' +
+      '<ul class="reasons">' + (reasons.map((r) => '<li>' + esc(r) + '</li>').join('') || '<li>无判定理由</li>') + '</ul>' +
+      (root ? '<div class="hint">根路径：' + esc(root.status) + ' · ' + esc(root.contentType || '-') + ' · ' + esc(root.size) + ' B' + (root.json ? ' · JSON' : '') + '</div>' : '') +
+      '<table><thead><tr><th>候选路径</th><th>状态码</th><th>Content-Type</th><th>字节数</th><th>解析</th><th>兜底判定</th></tr></thead><tbody>' +
+      (rows || '<tr><td colspan="6">无候选路径数据</td></tr>') + '</tbody></table>' +
+      '<div class="hint">判定顺序是「先否决再晋级」：HTML → 与根路径同字节（SPA 兜底）→ 非 JSON → 结构是否为 OpenAI 形状（顶层 <code>data[]</code> 且 <code>data[0].id</code> 是字符串）。只有 <code>models[]</code>（原生形状）、<code>models[]</code> 与 <code>data[]</code> 混合、或 id 是文件路径，都只算 L2 —— 这类端点接上去会在调用时报 500，所以不能报"可直接接入"。</div>' +
+      (result.level === 'L1'
+        ? ''
+        : '<div class="hint">分级只是<b>建议值</b>，不是门禁：如果你已经确认该端口可用（例如自己调过），可以在下方适配器里选「任意 OpenAI 兼容服务（直通）」并手动填端口直连。最终以 manifest 与你的判断为准。</div>');
+  }
+
+  async function runProbe(port) {
+    if (!port) { toast('该候选没有监听端口，先启动软件再探测', 'warn'); return; }
+    S.probeBusy = true;
+    S.probe = null;
+    renderProbe();
+    try {
+      const r = await api('/api/probe?port=' + encodeURIComponent(port));
+      S.probe = { port, result: r };
+      showError('');
+    } catch (e) {
+      S.probe = { port, result: { error: e.message } };
+      showError('探测失败：' + e.message);
+      toast('探测失败：' + e.message, 'err');
+    } finally {
+      S.probeBusy = false;
+      renderProbe();
+    }
+  }
+
+  // ---------- 扫描 ----------
+  async function loadScan(refresh) {
+    $('#list').innerHTML = '<div class="empty"><span class="spinner"></span> 正在扫描本机软件…</div>';
+    try {
+      const r = await api('/api/scan' + (refresh ? '?refresh=1' : ''));
+      S.candidates = r.candidates || [];
+      S.scanTotal = Number(r.total || S.candidates.length);
+      S.matchedTotal = Number(r.matchedTotal || 0);
+      renderList();
+      renderDetail();
+      showError('');
+      toast('扫描完成：' + r.total + ' 个本机软件，其中已适配 ' + S.matchedTotal + ' 个（' + r.tookMs + ' ms）', 'ok');
+    } catch (e) {
+      $('#list').innerHTML = '<div class="empty" style="color:var(--err)">扫描失败：' + esc(e.message) + '</div>';
+      showError('扫描失败：' + e.message);
+      toast('扫描失败：' + e.message, 'err');
+    }
+  }
+
+  // ---------- 适配器 ----------
+  async function loadAdapters() {
+    try {
+      const r = await api('/api/adapters');
+      S.adapters = r.adapters || [];
+      if (r.loadErrors && r.loadErrors.length) {
+        showError('有 ' + r.loadErrors.length + ' 个适配器加载失败（已隔离）：' +
+          r.loadErrors.slice(0, 3).map((e) => (e.file || '') + ' :: ' + e.field).join('；'));
+      }
+      renderAdapterOptions();
+      showError('');
+    } catch (e) {
+      showError('读取适配器失败：' + e.message);
+      toast('读取适配器失败：' + e.message, 'err');
+    }
+  }
+
+  function currentAdapter() {
+    return S.adapters.find((a) => a.id === S.adapterId) || null;
+  }
+
+  function adapterProviderText(a) {
+    if (!a) return '未选择提供方';
+    const hits = a.hits || [];
+    if (hits.length) {
+      return '本机软件：' + hits.map((h) => h.name + (h.running ? '（运行中）' : '（未运行）')).join('、');
+    }
+    if (a.serviceFace?.strategy === 'port-scan') {
+      return '本机软件：启动时自动确定——会连接第一个通过 `/v1/models` 判定的本机服务';
+    }
+    if (a.serviceFace?.strategy === 'remote') {
+      return '本机软件：' + (a.name || a.id) + '（借用它已配置好的远端通道）';
+    }
+    if (a.serviceFace?.strategy === 'listen-scan') {
+      return '本机软件：由你填写的上游端口决定';
+    }
+    return '本机软件：当前未识别到（适配器仍可尝试自起服务面）';
+  }
+
+  function renderAdapterOptions() {
+    const sel = $('#adapter-select');
+    if (!S.adapters.length) { sel.innerHTML = '<option value="">（没有可用适配器）</option>'; return; }
+    if (!S.adapterId) {
+      // 默认挑一个能直接跑的：优先「端口扫描」型，其次命中本机的
+      const prefer = S.adapters.find((a) => a.matchStatus === 'port-scan') ||
+                     S.adapters.find((a) => a.matchStatus === 'hit') ||
+                     S.adapters[0];
+      S.adapterId = prefer.id;
+    }
+    sel.innerHTML = S.adapters.map((a) => {
+      const hits = (a.hits || []).map((h) => h.name).join(' / ');
+      const tail = hits
+        ? ' — ' + hits
+        : a.serviceFace?.strategy === 'port-scan'
+          ? ' — 自动找本机服务'
+          : a.serviceFace?.strategy === 'remote'
+            ? ' — 远端通道'
+            : ' — 手动端口';
+      return '<option value="' + esc(a.id) + '"' + (a.id === S.adapterId ? ' selected' : '') + '>' +
+        esc(a.name + tail) + '</option>';
+    }).join('');
+    renderAdapterMeta();
+  }
+
+  function renderAdapterMeta() {
+    const a = currentAdapter();
+    if (!a) { $('#adapter-hint').textContent = ''; $('#adapter-provider').textContent = '未选择提供方软件'; $('#adapter-meta').textContent = ''; $('#port-wrap').style.display = 'none'; return; }
+    $('#adapter-sub').textContent = '适配器 ' + a.id;
+    $('#adapter-provider').textContent = adapterProviderText(a);
+    $('#adapter-hint').textContent = a.hint || '';
+    const parts = [];
+    parts.push('服务面类型：' + (a.serviceFace.type || '-'));
+    parts.push('端口发现：' + a.serviceFace.strategy);
+    if (a.serviceFace.strategy === 'port-scan') parts.push('候选端口：' + (a.serviceFace.candidates || []).join(' / '));
+    if (a.serviceFace.strategy === 'remote') parts.push('远端：' + (a.serviceFace.baseUrl || '-'));
+    parts.push('上游代理：' + (a.proxyEnv ? a.proxyEnv.label : '-'));
+    parts.push('凭据来源：' + (a.authKind || 'none'));
+    if (a.experimental) parts.push('★ 实验性：可能不可用，先看 quirks');
+    if (a.hits && a.hits.length) parts.push('匹配：' + a.hits.map((h) => h.name + (h.running ? '(运行中)' : '')).join('，'));
+    $('#adapter-meta').textContent = parts.join('　·　');
+    $('#port-wrap').style.display = a.needsUpstreamPort ? '' : 'none';
+    $('#btn-start').disabled = false;
+    renderFlow();
+  }
+
+  async function startProxy() {
+    const a = currentAdapter();
+    if (!a) { toast('没有可用适配器', 'err'); return; }
+    const body = { adapterId: a.id };
+    if (a.needsUpstreamPort) {
+      const raw = $('#upstream-port').value.trim();
+      if (!raw) { toast('该适配器需要填写上游端口', 'err'); $('#upstream-port').focus(); return; }
+      body.upstreamPort = Number(raw);
+    }
+    $('#btn-start').disabled = true;
+    $('#start-spin').style.display = '';
+    try {
+      const r = await api('/api/start', { method: 'POST', body: JSON.stringify(body) });
+      toast('已启动：' + r.baseUrl + '（' + (r.models || []).length + ' 个模型）', 'ok');
+      showError('');
+      await poll();
+    } catch (e) {
+      setLight('err', '异常');
+      showError('启动失败：' + e.message);
+      toast('启动失败：' + e.message, 'err');
+    } finally {
+      $('#btn-start').disabled = false;
+      $('#start-spin').style.display = 'none';
+    }
+  }
+
+  async function stopProxy() {
+    $('#btn-stop').disabled = true;
+    try {
+      const r = await api('/api/stop', { method: 'POST', body: '{}' });
+      toast(r.stopped ? ('已停止，释放端口：' + (r.ports || []).join(', ')) : '当前没有运行中的代理', r.stopped ? 'ok' : 'warn');
+      showError('');
+      await poll();
+    } catch (e) {
+      setLight('err', '异常');
+      showError('停止失败：' + e.message);
+      toast('停止失败：' + e.message, 'err');
+    } finally {
+      $('#btn-stop').disabled = false;
+    }
+  }
+
+  // ---------- 运行态 ----------
+  // 令牌不进 /api/status（那是每 3 秒一次的轮询接口），只走 /api/snippet。
+  // 这里缓存一份用于展示，缓存键是 baseURL：换了实例就重新取。
+  function snippetIsFresh(st) {
+    return Boolean(S.snippet && st && S.snippet.baseURL === st.baseURL);
+  }
+
+  function apiKeyText(st) {
+    if (snippetIsFresh(st)) return S.snippet.apiKey;
+    return '（点击复制时读取）';
+  }
+
+  async function ensureSnippet() {
+    const st = S.status;
+    if (!st || !st.running) throw new Error('代理未运行');
+    if (snippetIsFresh(st)) return S.snippet;
+    const s = await api('/api/snippet');
+    S.snippet = s;
+    $('#r-key').textContent = s.apiKey;
+    return s;
+  }
+
+  function renderModels() {
+    const st = S.status;
+    if (!st || !st.running) { $('#model-list').innerHTML = ''; $('#model-count').textContent = ''; return; }
+    const q = S.modelQuery.trim().toLowerCase();
+    const models = (st.models || []).filter((m) => !q || String(m.alias).toLowerCase().includes(q));
+    $('#model-count').textContent = '共 ' + (st.models || []).length + ' 个模型' + (q ? '，匹配 ' + models.length : '');
+    $('#model-list').innerHTML = models.slice(0, 300).map((m) =>
+      '<span class="m">' + esc(m.alias) + '<button data-model="' + esc(m.alias) + '">复制</button></span>').join('');
+    Array.from($('#model-list').querySelectorAll('[data-model]')).forEach((n) => {
+      n.addEventListener('click', () => copyText(n.getAttribute('data-model'), '模型名'));
+    });
+  }
+
+  // 结构条：让用户一眼看清"谁提供模型、谁在中间翻译、谁在使用"
+  function renderFlow() {
+    const st = S.status;
+    const c = selectedCandidate();
+    const a = currentAdapter();
+    const up = $('#flow-up');
+    const upSub = $('#flow-up-sub');
+    const midNode = $('#flow-mid-node');
+    const mid = $('#flow-mid');
+    const midSub = $('#flow-mid-sub');
+
+    if (st && st.running) {
+      const hs = (st.upstreamHealth && st.upstreamHealth.state) || 'ok';
+      const label = hs === 'ok' ? '运行中' : hs === 'degraded' ? '上游抖动' : '上游异常';
+      up.textContent = st.providerName || st.upstreamName || st.adapterName || st.adapter || '（未知）';
+      upSub.textContent = '提供方 · ' + (st.upstreamPort != null ? '127.0.0.1:' + st.upstreamPort : st.upstreamBaseUrl || '-');
+      mid.textContent = label + ' · ' + (st.models ? st.models.length : 0) + ' 个模型';
+      midSub.textContent = (st.baseURL || '').replace(/\/v1$/, '') + ' · 下游填这个地址';
+      midNode.classList.add('on');
+      return;
+    }
+
+    midNode.classList.remove('on');
+    mid.textContent = '未启动';
+    midSub.textContent = '127.0.0.1:— · 启动后才有地址';
+    if (c) {
+      up.textContent = c.name || '(未命名)';
+      upSub.textContent = '左侧选中的提供方软件；适配器已自动切到下方';
+    } else if (a) {
+      up.textContent = adapterProviderText(a).replace(/^本机软件：/, '');
+      upSub.textContent = '下方选中的提供方；点「启动代理」即可接入';
+    } else {
+      up.textContent = '未选择';
+      upSub.textContent = '谁有模型能力：agent 客户端 / 本地推理服务';
+    }
+  }
+
+  function renderRunning() {
+    const st = S.status;
+    const box = $('#running');
+    if (!st || !st.running) {
+      box.classList.remove('show');
+      setLight('off', '未运行');
+      S.snippet = null;
+      renderFlow();
+      return;
+    }
+    box.classList.add('show');
+    const h = st.upstreamHealth || { state: 'ok' };
+    const hState = h.state || 'ok';
+    const hLabel = hState === 'ok' ? '正常' : hState === 'degraded' ? '抖动' : '异常';
+    if (hState === 'down') setLight('err', '上游异常');
+    else if (hState === 'degraded') setLight('err', '上游抖动');
+    else setLight('on', '运行中');
+    const provider = st.providerName || st.upstreamName || '-';
+    $('#r-adapter').textContent = '提供方：' + provider + ' · 接入：' + st.adapterName + ' · 端口 ' + st.port + (st.upstreamPort != null ? ' · 上游 ' + st.upstreamPort : '') + ' · 上游健康 ' + hLabel;
+    $('#r-base').textContent = st.baseURL || '';
+    $('#r-key').textContent = apiKeyText(st);
+    const first = (st.models && st.models[0] && st.models[0].alias) || '（模型清单为空）';
+    $('#r-model').textContent = first;
+    const s = st.stats || {};
+    $('#r-stats').innerHTML =
+      '<span>请求 ' + (s.requests || 0) + '</span>' +
+      '<span>错误 ' + (s.errors || 0) + '</span>' +
+      '<span>P95 ' + (s.p95Ms == null ? '-' : s.p95Ms + ' ms') + '</span>' +
+      '<span>流式 ' + esc(st.streaming) + '</span>' +
+      '<span>运行 ' + (s.uptimeSec || 0) + ' s</span>' +
+      '<span>凭证 ' + esc((st.credential && st.credential.kind) || '-') + '</span>' +
+      '<span title="' + esc(h.lastError || '最近一次探测正常') + '">上游健康 ' + esc(hLabel) + '（连续失败 ' + (h.consecutiveFailures || 0) + ' 次）</span>';
+    renderFlow();
+    renderModels();
+  }
+
+  async function poll() {
+    try {
+      const st = await api('/api/status');
+      S.status = st;
+      renderRunning();
+      // 状态里没有令牌，横幅要显示 apiKey 就得单独取一次 snippet（每个实例只取一次）
+      if (st.running && !snippetIsFresh(st)) {
+        ensureSnippet().catch((e) => {
+          $('#r-key').textContent = '（读取令牌失败：' + e.message + '）';
+        });
+      }
+    } catch (e) {
+      setLight('err', '异常');
+      showError('状态轮询失败：' + e.message);
+    }
+  }
+
+  // ---------- 事件绑定 ----------
+  $('#btn-rescan').addEventListener('click', () => loadScan(true));
+  $('#only-matched').addEventListener('change', (e) => { S.onlyMatched = e.target.checked; renderList(); });
+  $('#show-all').addEventListener('change', (e) => { S.showAll = e.target.checked; renderList(); });
+  $('#filter').addEventListener('input', (e) => { S.query = e.target.value; renderList(); });
+  $('#adapter-select').addEventListener('change', (e) => { S.adapterId = e.target.value; renderAdapterMeta(); });
+  $('#upstream-port').addEventListener('input', (e) => { S.upstreamPort = e.target.value; });
+  $('#btn-start').addEventListener('click', startProxy);
+  $('#btn-stop').addEventListener('click', stopProxy);
+  $('#model-search').addEventListener('input', (e) => { S.modelQuery = e.target.value; renderModels(); });
+
+  document.addEventListener('click', async (e) => {
+    const node = e.target;
+    if (!node || typeof node.closest !== 'function') return;
+    const target = node.closest('[data-copy]');
+    if (!target) return;
+    const key = target.getAttribute('data-copy');
+    // apiKey 不在轮询响应里，点复制时按需取一次
+    if (key === 'r-key') {
+      try {
+        const s = await ensureSnippet();
+        await copyText(s.apiKey, 'apiKey');
+      } catch (err) {
+        showError('读取 apiKey 失败：' + err.message);
+        toast('读取 apiKey 失败：' + err.message, 'err');
+      }
+      return;
+    }
+    const src = document.getElementById(key);
+    if (src) copyText(src.textContent, '');
+  });
+
+  // ---------- 启动 ----------
+  setLight('off', '未运行');
+  loadAdapters().then(() => loadScan(false)).then(() => poll());
+  setInterval(poll, 3000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+{"_tag":"ProviderRequestError","providerID":"opencode","reason":"rate_limit","message":"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go","status":429,"retryAfterMs":31556000}

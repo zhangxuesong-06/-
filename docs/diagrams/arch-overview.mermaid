@@ -1,0 +1,58 @@
+%% 03-architecture.md §D.1 分层架构
+flowchart TB
+    subgraph L5["控制面 Control Plane"]
+        UI1["Tauri WebView UI<br/>列表/详情/运行态/设置"]
+        UI2["Admin API (loopback + 独立 token)"]
+    end
+    subgraph L4["编排 Orchestrator"]
+        OR1["ProxyController<br/>start/stop/restart"]
+        OR2["ServiceFaceSupervisor<br/>spawn + Job Object + pidfile"]
+        OR3["HealthMonitor<br/>周期探测 + 假绿判定"]
+    end
+    subgraph L3["代理运行时 Runtime"]
+        RT1["ProxyServer (axum/hyper)<br/>/v1/* + SSE"]
+        RT2["AuthGuard + CorsGuard"]
+        RT3["ConcurrencyLimiter<br/>有界队列 + 硬超时"]
+        RT4["UpstreamClient<br/>连接池 + 取消传播"]
+    end
+    subgraph L2["适配层 Adapter"]
+        AD1["ManifestLoader<br/>schema 校验 + 故障隔离"]
+        AD2["TranslatorRegistry"]
+        AD3["translators: openai-passthrough /<br/>http-openapi / acp / http-custom / cli-headless"]
+        AD4["ModelCatalog<br/>别名 ↔ 上游 id ↔ 能力位"]
+    end
+    subgraph L1["发现层 Discovery"]
+        DI1["DiscoverySource: registry / process /<br/>convention / package / desktop-entry"]
+        DI2["AppResolver<br/>路径规范化 + 去重 + 置信度"]
+        DI3["CapabilityProbe<br/>端口/响应体形态/SPA 兜底/CLI help"]
+    end
+    subgraph L0["横切 Cross-cutting"]
+        X1["Security: SecretString / DPAPI / Keychain"]
+        X2["AuditLog: 结构化 + 脱敏 + 滚动"]
+        X3["ConfigStore"]
+        X4["Platform: Win32 / POSIX 进程与端口抽象"]
+    end
+
+    UI1 --> OR1
+    UI2 --> OR1
+    OR1 --> OR2
+    OR1 --> RT1
+    OR3 --> DI3
+    OR3 --> RT4
+    RT1 --> RT2 --> RT3 --> RT4
+    RT1 --> AD2
+    AD2 --> AD3
+    AD3 --> AD4
+    AD3 --> RT4
+    OR2 --> AD1
+    OR1 --> DI2
+    DI2 --> DI1
+    DI2 --> DI3
+    AD1 --> AD3
+    RT4 --> X4
+    OR2 --> X4
+    DI1 --> X4
+    OR2 --> X1
+    RT4 --> X1
+    RT1 --> X2
+    OR1 --> X3

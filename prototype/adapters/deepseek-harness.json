@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "id": "deepseek-harness",
+  "name": "DeepSeek Harness（实验：借用其凭据与中转）",
+  "level": "experimental",
+  "maintainer": "apx",
+  "version": "0.1.0",
+  "description": "不启动任何进程，直接把该 agent 已配置好的远端中转当作 OpenAI 兼容上游：凭据从它自己的凭据文件里按正则读（每请求现取），端点固定为 /v1/models 与 /v1/chat/completions。注意：这里复用的只是「凭据 + 中转地址」，不复用它的编排、工具调用与会话状态。",
+  "testedWith": [],
+  "match": {
+    "exeNames": ["DeepSeek Harness.exe"],
+    "pathGlobs": [],
+    "registryNamePattern": "deepseek"
+  },
+  "serviceFace": {
+    "type": "openai-passthrough",
+    "baseUrl": "https://sekirocloud.shop",
+    "portDiscovery": {
+      "strategy": "remote"
+    },
+    "proxyEnv": "clear",
+    "auth": {
+      "type": "none"
+    }
+  },
+  "upstream": {
+    "baseUrl": "https://sekirocloud.shop",
+    "auth": {
+      "kind": "regex-file",
+      "path": "~/.dsh/.credentials.yaml",
+      "pattern": "DSH_API_KEY:\\s*[\"']?([^\\s\"']+)",
+      "group": 1,
+      "scheme": "bearer"
+    },
+    "listModels": {
+      "path": "/v1/models",
+      "items": "$.data"
+    },
+    "generate": {
+      "path": "/v1/chat/completions",
+      "textPath": "$.choices[0].message.content"
+    },
+    "requestHooks": []
+  },
+  "capabilities": {
+    "streaming": true,
+    "tools": false,
+    "vision": false,
+    "embeddings": false
+  },
+  "sessionPolicy": "stateless",
+  "quirks": {
+    "requiresUserSession": true,
+    "knownIssues": [
+      "【重要·如实记录】截至 2026-11-04 实测：GET /v1/models 可返回 200（2 个模型），但 POST /v1/chat/completions 不可用（中转返回 502/503，响应体是 HTML 错误页）。本适配器只表示「机制就绪」，不代表「现在能用」。",
+      "复用的是该 agent 的凭据与中转地址，不复用它的编排能力、工具调用与会话状态；因此 tool_calls 等字段会被显式拒绝（400），不会静默降级。",
+      "凭据从 ~/.dsh/.credentials.yaml 按正则 DSH_API_KEY 读取，每请求现取（宿主刷新后无需重启）；文件被移动/改格式会导致读不到凭据 → 上游 401，而不是启动失败。",
+      "serviceFace.baseUrl / upstream.baseUrl 只写 origin（https://sekirocloud.shop），路径一律写在各 endpoint 的 path 里（/v1/models、/v1/chat/completions）。loader 会校验这一点：带路径的 baseUrl 直接加载失败，主程序不做任何猜测性拼接。",
+      "proxyEnv 声明为 clear（绕开系统代理）。当前 Node 的 fetch 默认不读 HTTP_PROXY，所以这条声明对 remote 型主要是「意图声明」；真正生效的是自起型上游。",
+      "把该 agent 的订阅额度开放给任意本机程序，可能触及该服务条款（例如仅限其客户端内使用）。是否合规由使用者自行判断，本工具不代为背书。"
+    ]
+  }
+}

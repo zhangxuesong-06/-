@@ -1,0 +1,32 @@
+%% 03-architecture.md §C.8.2 一次流式 chat 请求（含取消与背压）
+sequenceDiagram
+    autonumber
+    participant Cs as consumer (OpenAI SDK)
+    participant G as AuthGuard
+    participant Px as ProxyServer
+    participant Tr as Translator
+    participant Up as 上游服务面
+    participant Au as AuditLog
+
+    Cs->>G: POST /v1/chat/completions (Bearer sk-local-...) stream:true
+    G->>G: 常量时间比对 → 通过
+    G->>Px: 转发
+    Px->>Tr: translate(request)
+    Tr->>Tr: 校验字段（tools/response_format → 400 早退）
+    Tr->>Tr: model 别名转 {providerID, modelID}；messages 压平为 prompt
+    Tr->>Up: POST /api/session 建立会话（或 stateless 端点）
+    Up-->>Tr: sessionId
+    Tr->>Up: POST /api/session/{id}/prompt
+    Up-->>Tr: 200 Inbox.User（入队回执，非结果）
+    Px-->>Cs: 200 + text/event-stream（首帧 role）
+    loop 增量
+        Tr->>Up: GET /api/event（订阅 SSE，按 sessionId 过滤）
+        Up-->>Tr: event message.part.updated {delta}
+        Tr->>Px: chunk {delta.content}
+        Px-->>Cs: data {...} 空行
+        Note over Px,Cs: 有界 channel 满则反压上游，不丢帧不 OOM
+    end
+    Tr->>Px: 末帧 finish_reason=stop（+usage 估算帧）
+    Px-->>Cs: data [DONE] 空行 → close
+    Px->>Au: reqId, model, status, firstTokenMs, totalMs, usage, usageSource
+    Note over Cs,Px: consumer 断连 → 立即 abort 上游请求（防继续烧额度）

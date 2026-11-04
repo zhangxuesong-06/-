@@ -1,0 +1,23 @@
+{
+  "name": "apx-agent-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent Proxy Launcher — 把本机 agent 的模型能力暴露为 127.0.0.1 上的 OpenAI 兼容端点",
+  "type": "module",
+  "bin": { "apx": "./src/cli.mjs" },
+  "scripts": {
+    "scan": "node src/cli.mjs scan",
+    "ui": "node src/cli.mjs ui",
+    "test": "node test/smoke.mjs",
+    "test:probe": "node test/probe.test.mjs",
+    "test:token": "node test/token.test.mjs",
+    "test:console": "node test/console.test.mjs",
+    "test:stop": "node test/stop-safety.mjs",
+    "test:adapters": "node test/adapters.test.mjs",
+    "test:translator": "node test/translator.test.mjs",
+    "test:health": "node test/health.test.mjs",
+    "test:e2e": "node test/e2e-real.mjs",
+    "test:all": "node test/smoke.mjs && node test/probe.test.mjs && node test/token.test.mjs && node test/translator.test.mjs && node test/health.test.mjs && node test/console.test.mjs && node test/stop-safety.mjs && node test/adapters.test.mjs && node test/e2e-real.mjs"
+  },
+  "engines": { "node": ">=18" }
+}

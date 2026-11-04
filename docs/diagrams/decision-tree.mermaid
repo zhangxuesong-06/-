@@ -1,0 +1,32 @@
+%% 03-architecture.md §C.2 可代理性决策树
+flowchart TD
+    S["候选 app 已定位 exe 与版本"] --> Q1{"进程存在且有 LISTEN 端口?"}
+
+    Q1 -- 否 --> N1{"存在配置/目录证明可启动?"}
+    N1 -- 否 --> Q2{"CLI 的 --help 含无头子命令?<br/>关键词 print/exec/run/prompt/json/format"}
+    N1 -- 是 --> ST["状态 = 未就绪<br/>提示用户先启动该软件"]
+    Q2 -- 否 --> L0["L0 不可代理"]
+    Q2 -- 是 --> L3["L3 CLI 包装"]
+
+    Q1 -- 是 --> P1["对每个 LISTEN 端口探测<br/>GET /v1/models, /models, /api/v1/models<br/>超时 2s，并发"]
+    P1 --> J1{"响应 Content-Type 是 json<br/>且 body 满足 data[].id ?"}
+    J1 -- 是 --> L1["L1 端口直通"]
+
+    J1 -- 否 --> J1b{"与 GET / 字节数/哈希相同?<br/>或 Content-Type 是 text/html?"}
+    J1b -- 是 --> SP["SpaIgnoresApi<br/>UI 静态资源，不是 API 面"]
+    J1b -- 否 --> J2{"有 JSON 响应体 (任意状态码)?"}
+    J2 -- 是 --> L2A["L2 协议适配"]
+
+    SP --> Q3{"存在可程序化取得的服务面?"}
+    J2 -- 否 --> Q3
+    Q3 --> K1{"CLI 有 serve/server/acp 子命令?"}
+    K1 -- 是 --> SF["自起隔离实例<br/>serve --hostname 127.0.0.1 --port PORT"]
+    SF --> J3{"新端口 /v1/models 满足 L1?"}
+    J3 -- 是 --> L1
+    J3 -- 否 --> J4{"有 OpenAPI/ACP 契约可得?"}
+    J4 -- 是 --> L2A
+    J4 -- 否 --> L2B["L2 待定（标未知）"]
+
+    K1 -- 否 --> K2{"能读到上游 baseURL + 凭据?"}
+    K2 -- 是 --> C1["C1 凭据型（P1）"]
+    K2 -- 否 --> Q2

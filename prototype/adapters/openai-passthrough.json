@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "openai-passthrough",
+  "name": "任意 OpenAI 兼容服务（直通）",
+  "level": "official",
+  "maintainer": "apx",
+  "version": "1.0.0",
+  "description": "给已经是 OpenAI 兼容的本地服务用（监听端口已知时）。也是 L1 管道冒烟夹具。",
+  "match": {
+    "exeNames": [],
+    "pathGlobs": [],
+    "registryNamePattern": null
+  },
+  "serviceFace": {
+    "type": "openai-passthrough",
+    "portDiscovery": {
+      "strategy": "listen-scan"
+    },
+    "proxyEnv": "clear",
+    "auth": {
+      "type": "none"
+    }
+  },
+  "upstream": {
+    "listModels": {
+      "path": "/v1/models",
+      "items": "$.data"
+    },
+    "generate": {
+      "path": "/v1/chat/completions",
+      "textPath": "$.choices[0].message.content"
+    },
+    "auth": {
+      "kind": "none"
+    },
+    "requestHooks": []
+  },
+  "capabilities": {
+    "streaming": true,
+    "tools": true,
+    "vision": true,
+    "embeddings": false
+  },
+  "sessionPolicy": "stateless",
+  "quirks": {
+    "requiresUserSession": false,
+    "knownIssues": [
+      "需要 --upstream-port 指定上游端口"
+    ]
+  }
+}

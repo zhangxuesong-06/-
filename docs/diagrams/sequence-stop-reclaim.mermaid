@@ -1,0 +1,19 @@
+%% 03-architecture.md §C.6.3 停止即回收
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant C as apx-core
+    participant J as Job Object / 进程组
+    participant L as 上游服务面
+    participant P as ProxyServer
+
+    U->>C: 点「停止」
+    C->>P: shutdown(grace=3s)
+    P-->>C: 连接已 drain（在途 SSE 先发 DONE）
+    C->>P: 关闭 listener（端口立即可复用）
+    C->>J: 终止作业对象
+    J->>L: TerminateProcess / killpg 全树
+    Note over J,L: Windows: Job Object KILL_ON_JOB_CLOSE<br/>POSIX: killpg SIGTERM → 3s → SIGKILL
+    C->>C: 轮询验证端口已释放（connect 应 refused），最多 5s
+    C->>C: 删除 portfile / pidfile，写审计「已回收」
+    C-->>U: 完成（含端口已释放 / N 个进程已结束明细）

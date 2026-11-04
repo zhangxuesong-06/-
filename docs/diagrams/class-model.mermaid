@@ -1,0 +1,185 @@
+%% 03-architecture.md §D.6 数据结构与接口
+classDiagram
+    direction LR
+
+    class DiscoverySource {
+        <<interface>>
+        +id() str
+        +platform() Platform
+        +scan(ctx) Vec~RawHit~
+        +timeout() Duration
+    }
+
+    class InstalledApp {
+        +id: AppId
+        +name: String
+        +exePath: PathBuf
+        +installDir: Option~PathBuf~
+        +version: Option~VersionHit~
+        +sources: Vec~SourceRef~
+        +confidence: f32
+        +mainPid: Option~u32~
+        +listenPorts: Vec~u16~
+        +stale: bool
+        +probe() ProbeResult
+    }
+
+    class VersionHit {
+        +raw: String
+        +parsed: Version
+        +source: VersionSource
+        +confidence: f32
+    }
+
+    class ProbeResult {
+        +level: Level
+        +reasons: Vec~Reason~
+        +spaIgnoresApi: bool
+        +upstreamShape: UpstreamShape
+        +serviceFaceHint: Option~ServiceFaceKind~
+    }
+
+    class Manifest {
+        +schemaVersion: u32
+        +id: ManifestId
+        +level: MaintainerLevel
+        +version: String
+        +testedWith: Vec~String~
+        +match: MatchRules
+        +versionSpec: VersionSpec
+        +serviceFace: ServiceFaceSpec
+        +upstreamApi: UpstreamApiSpec
+        +capabilities: Capabilities
+        +sessionPolicy: SessionPolicy
+        +validate() Result
+    }
+
+    class ServiceFaceSpec {
+        +kind: ServiceFaceKind
+        +translator: TranslatorRef
+        +portDiscovery: PortStrategy
+        +launch: Option~LaunchSpec~
+        +auth: AuthSpec
+        +health: HealthSpec
+    }
+
+    class Translator {
+        <<interface>>
+        +id() TranslatorId
+        +supportedFields() FieldSet
+        +listModels(up) Vec~ModelEntry~
+        +chat(up, req) ChatOutcome
+        +chatStream(up, req, cancel) Stream~Chunk~
+    }
+
+    class HttpOpenApiTranslator {
+        -mapping: RequestMapping
+        -sessionPolicy: SessionPolicy
+    }
+    class AcpTranslator {
+        -rpc: JsonRpcStdio
+    }
+    class OpenAiPassthroughTranslator
+
+    class ModelCatalog {
+        +aliases: HashMap~String, UpstreamModelId~
+        +resolve(alias) Result~UpstreamModelId~
+        +markVerified(alias, ok) void
+    }
+
+    class ModelEntry {
+        +alias: String
+        +upstreamId: UpstreamModelId
+        +source: ModelSource
+        +verified: bool
+        +capabilities: Capabilities
+    }
+
+    class ServiceFaceSupervisor {
+        -job: Option~JobHandle~
+        -pidFile: PathBuf
+        +spawn(spec, port) UpstreamHandle
+        +healthCheck(h) HealthState
+        +stop(grace) StopReport
+        +reapOrphans() Vec~OrphanReport~
+    }
+
+    class UpstreamHandle {
+        +port: u16
+        +baseUrl: Url
+        +secret: SecretString
+        +pid: u32
+        +processStartTime: u64
+        +startedByUs: bool
+    }
+
+    class ProxyController {
+        +start(appId, cfg) Result
+        +stop() StopReport
+        +status() RuntimeStatus
+    }
+
+    class ProxyServer {
+        -listener: TcpListener
+        +bind(addr) u16
+        +serve(router) Result
+        +shutdown(grace) void
+    }
+
+    class UpstreamClient {
+        +get(url, secret) Response
+        +postJson(url, secret, body) Response
+        +openSse(url, secret, cancel) Stream~SseEvent~
+        +abortAll() void
+    }
+
+    class AuthGuard {
+        -token: SecretString
+        +verify(h) Result
+        +rotate() SecretString
+    }
+
+    class CorsGuard {
+        +inspect(headers) Verdict
+        +isPreflight(headers) bool
+    }
+
+    class AuditLog {
+        +record(ev) void
+        +redact(s) String
+        +purge() void
+    }
+
+    class SecretString {
+        -inner: Zeroizing~String~
+        +expose() str
+    }
+
+    DiscoverySource <|.. WinRegistrySource
+    DiscoverySource <|.. WinProcessSource
+    DiscoverySource <|.. MacSysProfilerSource
+    DiscoverySource <|.. LinuxDesktopSource
+    DiscoverySource ..> InstalledApp : produces
+    InstalledApp --> VersionHit
+    InstalledApp --> ProbeResult
+    InstalledApp --> Manifest : matched by
+
+    Manifest *-- ServiceFaceSpec
+    ServiceFaceSpec --> Translator
+    Translator <|.. HttpOpenApiTranslator
+    Translator <|.. AcpTranslator
+    Translator <|.. OpenAiPassthroughTranslator
+    HttpOpenApiTranslator --> ModelCatalog
+    HttpOpenApiTranslator --> UpstreamHandle
+
+    ProxyController --> ProxyServer
+    ProxyController --> ServiceFaceSupervisor
+    ProxyController --> Manifest
+    ServiceFaceSupervisor --> UpstreamHandle
+    UpstreamHandle --> SecretString
+    ProxyServer --> AuthGuard
+    ProxyServer --> CorsGuard
+    ProxyServer --> Translator
+    Translator --> UpstreamClient
+    UpstreamClient --> SecretString
+    ProxyServer --> AuditLog
