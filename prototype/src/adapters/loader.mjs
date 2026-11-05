@@ -59,6 +59,26 @@ function validate(m, file) {
       });
     }
   }
+  // 并发/超时上限（N7）：只接受正整数（maxQueue 允许 0 = 不排队），写错在加载时报错。
+  if (m.limits !== undefined) {
+    if (!m.limits || typeof m.limits !== 'object' || Array.isArray(m.limits)) {
+      errors.push({ field: 'limits', expected: 'object', actual: JSON.stringify(m.limits) });
+    } else {
+      for (const [key, min] of [
+        ['maxConcurrent', 1],
+        ['maxQueue', 0],
+        ['queueTimeoutMs', 1],
+        ['requestTimeoutMs', 1],
+        ['streamFirstByteTimeoutMs', 1],
+        ['streamIdleTimeoutMs', 1],
+      ]) {
+        if (m.limits[key] === undefined) continue;
+        if (!Number.isInteger(m.limits[key]) || m.limits[key] < min) {
+          errors.push({ field: `limits.${key}`, expected: `integer >= ${min}`, actual: String(m.limits[key]) });
+        }
+      }
+    }
+  }
   // baseUrl 必须是 origin（协议://host[:port]，不带路径、不带尾斜杠）。
   // 这是「规范化」而不是「拼接去重魔法」：路径一律写在各 endpoint 的 path 里，
   // 主程序不做任何猜测性改写，写错就在加载时报错。

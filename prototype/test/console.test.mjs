@@ -194,6 +194,8 @@ async function main() {
       const raw = JSON.stringify(j);
       check('/api/status running=true', j.running === true, raw.slice(0, 200));
       check('status 带端口与模型', j.port > 0 && (j.models || []).length > 0);
+      check('status 带并发统计', j.concurrency?.maxConcurrent > 0 && typeof j.concurrency.active === 'number', JSON.stringify(j.concurrency));
+      check('status 带最近请求字段', Array.isArray(j.recentRequests), JSON.stringify(j.recentRequests));
       // R2：轮询接口绝不能带凭据明文
       check('/api/status 不含 apiKey 字段', !('apiKey' in j), Object.keys(j).join(','));
       check('/api/status 响应体不含 sk-local-', !raw.includes('sk-local-'));

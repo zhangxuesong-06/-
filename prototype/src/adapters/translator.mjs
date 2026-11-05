@@ -118,6 +118,11 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
   const upstream = adapter.upstream || {};
   const caps = adapter.capabilities || {};
   const hooks = upstream.requestHooks || [];
+  const limits = adapter.limits || {};
+  const positive = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : d);
+  const requestTimeoutMs = positive(limits.requestTimeoutMs, 120000);
+  const firstByteTimeoutMs = positive(limits.streamFirstByteTimeoutMs, 60000);
+  const streamIdleTimeoutMs = positive(limits.streamIdleTimeoutMs, 120000);
 
   async function buildHeaders(extra = {}) {
     const cred = await ctx.credentials.get();
@@ -134,9 +139,20 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
     };
   }
 
-  async function requestOnce(pathname, { method = 'GET', body, timeout = 120000 } = {}) {
+  async function requestOnce(pathname, { method = 'GET', body, timeout = requestTimeoutMs, signal } = {}) {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeout);
+    let timedOut = false;
+    let clientAborted = Boolean(signal?.aborted);
+    const onClientAbort = () => {
+      clientAborted = true;
+      ctrl.abort();
+    };
+    if (signal && !signal.aborted) signal.addEventListener('abort', onClientAbort, { once: true });
+    if (clientAborted) ctrl.abort();
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, timeout);
     try {
       const res = await fetch(`${ctx.baseUrl}${pathname}`, {
         method,
@@ -152,8 +168,21 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
         /* 上游可能返回非 JSON */
       }
       return { status: res.status, json, text, contentType: res.headers.get('content-type') || '', retryAfterMs: parseRetryAfter(res.headers.get('retry-after')) };
+    } catch (e) {
+      // 超时和「连接被拒」要分开：前者 504，后者 502。
+      return {
+        status: 0,
+        json: null,
+        text: timedOut ? `上游超时（>${timeout}ms）` : String(e.message || e),
+        contentType: '',
+        retryAfterMs: null,
+        transportError: true,
+        timeout: timedOut,
+        clientAborted,
+      };
     } finally {
       clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onClientAbort);
     }
   }
 
@@ -164,7 +193,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
       r = await requestOnce(pathname, opts);
     } catch (e) {
       // 连响应都没有（超时 / 连接被拒 / 连接被重置）：交给 upstreamError 归一到 502
-      return { status: 0, json: null, text: String(e.message || e), contentType: '', retryAfterMs: null, transportError: true };
+      return { status: 0, json: null, text: String(e.message || e), contentType: '', retryAfterMs: null, transportError: true, clientAborted: Boolean(opts.signal?.aborted) };
     }
     if (r.status === 401 && ctx.credentials.kind !== 'none') {
       onEvent('[apx] 上游 401，重读凭证后重放一次');
@@ -172,7 +201,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
       try {
         r = await requestOnce(pathname, opts);
       } catch (e) {
-        return { status: 0, json: null, text: String(e.message || e), contentType: '', retryAfterMs: null, transportError: true };
+        return { status: 0, json: null, text: String(e.message || e), contentType: '', retryAfterMs: null, transportError: true, clientAborted: Boolean(opts.signal?.aborted) };
       }
     }
     return r;
@@ -202,7 +231,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
     return { models };
   }
 
-  async function chat(body) {
+  async function chat(body, { signal } = {}) {
     const unsupported = detectUnsupported(body, caps);
     if (unsupported.length) {
       return {
@@ -222,7 +251,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
           status: 404,
           code: 'apx_model_not_found',
           param: 'model',
-          message: `模型 ${body.model} 不在清单中。先 GET /v1/models 查看可用模型。`,
+          message: `模型 ${body.model} 不在清单中。下游配置里的 model 必须与 GET /v1/models 返回的 id 完全一致。`,
         },
       };
     }
@@ -234,7 +263,21 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
     if (face.type === 'openai-passthrough') {
       const passthroughBody = { ...body, model: resolved.upstreamId, stream: false };
       applyHooks(passthroughBody, hooks);
-      const r = await request(spec.path || '/v1/chat/completions', { method: 'POST', body: passthroughBody });
+      let r = await request(spec.path || '/v1/chat/completions', { method: 'POST', body: passthroughBody, signal });
+      let strippedReasoning = false;
+      // 非推理模型（如 qwen2.5:0.5b）看到 reasoning_effort 会直接 400。
+      // 只在这种明确的“不支持思考”错误上退一步：去掉该字段重试一次，并如实标注降级。
+      if (
+        r.status === 400 &&
+        Object.prototype.hasOwnProperty.call(passthroughBody, 'reasoning_effort') &&
+        /thinking|reasoning/i.test(String(r.text || ''))
+      ) {
+        const retryBody = { ...passthroughBody };
+        delete retryBody.reasoning_effort;
+        r = await request(spec.path || '/v1/chat/completions', { method: 'POST', body: retryBody, signal });
+        strippedReasoning = true;
+      }
+      if (r.clientAborted) return { error: { status: 499, code: 'apx_client_aborted', message: '客户端已断开，已取消上游请求', clientAborted: true } };
       if (r.status !== 200 || !r.json) return { error: upstreamError(r) };
       const choice = r.json.choices?.[0];
       const upstreamMessage = choice?.message;
@@ -255,7 +298,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
         finishReason: choice?.finish_reason || (toolCalls.length ? 'tool_calls' : legacyCall ? 'function_call' : 'stop'),
         usage: r.json.usage,
         usageEstimated: false,
-        apxDegraded: [],
+        apxDegraded: strippedReasoning ? ['reasoning_effort'] : [],
       };
     }
 
@@ -263,7 +306,8 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
     const vars = { prompt, model: resolved };
     const reqBody = spec.body ? buildBody(spec.body, vars) : { prompt };
     applyHooks(reqBody, hooks);
-    const r = await request(spec.path, { method: 'POST', body: reqBody });
+    const r = await request(spec.path, { method: 'POST', body: reqBody, signal });
+    if (r.clientAborted) return { error: { status: 499, code: 'apx_client_aborted', message: '客户端已断开，已取消上游请求', clientAborted: true } };
     if (r.status !== 200 || !r.json) return { error: upstreamError(r) };
 
     const text = getPath(r.json, spec.textPath || '$.data.text');
@@ -292,7 +336,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
    * 原生流式：返回上游原始 Response（web stream），由 server 边读边写。
    * 只在适配器声明 streaming 能力时可用——否则宁可诚实降级为伪流式。
    */
-  async function openStream(body) {
+  async function openStream(body, { signal } = {}) {
     if (!caps.streaming) return { unsupported: true };
     // 流式路径不能绕过能力校验：否则声明 tools:false 的适配器会把 tools 原样塞给上游，
     // 上游要么忽略（下游拿到残缺结果），要么报一个与真实原因无关的错。
@@ -309,7 +353,14 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
     }
     const resolved = ctx.resolveModel(body.model);
     if (!resolved) {
-      return { error: { status: 404, code: 'apx_model_not_found', param: 'model', message: `模型 ${body.model} 不在清单中` } };
+      return {
+        error: {
+          status: 404,
+          code: 'apx_model_not_found',
+          param: 'model',
+          message: `模型 ${body.model} 不在清单中。下游配置里的 model 必须与 GET /v1/models 返回的 id 完全一致。`,
+        },
+      };
     }
     const spec = upstream.generate || {};
     let payload;
@@ -322,6 +373,18 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
     applyHooks(payload, hooks);
 
     const ctrl = new AbortController();
+    let abortReason = null;
+    let clientAborted = Boolean(signal?.aborted);
+    const onClientAbort = () => {
+      clientAborted = true;
+      ctrl.abort();
+    };
+    if (signal && !signal.aborted) signal.addEventListener('abort', onClientAbort, { once: true });
+    if (clientAborted) ctrl.abort();
+    const headerTimer = setTimeout(() => {
+      abortReason = 'timeout';
+      ctrl.abort();
+    }, firstByteTimeoutMs);
     let res;
     try {
       res = await fetch(`${ctx.baseUrl}${spec.path || '/v1/chat/completions'}`, {
@@ -331,10 +394,24 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
         signal: ctrl.signal,
       });
     } catch (e) {
-      return { error: upstreamError({ status: 0, json: null, text: String(e.message || e), transportError: true }) };
+      clearTimeout(headerTimer);
+      if (signal) signal.removeEventListener('abort', onClientAbort);
+      return {
+        error: clientAborted
+          ? { status: 499, code: 'apx_client_aborted', message: '客户端已断开，已取消上游请求', clientAborted: true }
+          : upstreamError({
+              status: 0,
+              json: null,
+              text: abortReason === 'timeout' ? `上游首字节超时（>${firstByteTimeoutMs}ms）` : String(e.message || e),
+              transportError: true,
+              timeout: abortReason === 'timeout',
+            }),
+      };
     }
+    clearTimeout(headerTimer);
 
     if (!res.ok) {
+      if (signal) signal.removeEventListener('abort', onClientAbort);
       const text = await res.text();
       let json = null;
       try {
@@ -344,7 +421,40 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
       }
       return { error: upstreamError({ status: res.status, json, text, retryAfterMs: parseRetryAfter(res.headers.get('retry-after')) }) };
     }
-    return { stream: res.body, status: res.status, contentType: res.headers.get('content-type'), abort: () => ctrl.abort() };
+
+    // 首字节之后按「空闲超时」计时：上游长时间不吐新块就取消，避免连接挂死。
+    // 下游背压时用 pause/resume 暂停计时，别把「客户端读得慢」误判成上游故障。
+    let idleTimer = null;
+    const touch = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        abortReason = 'idle-timeout';
+        ctrl.abort();
+      }, streamIdleTimeoutMs);
+      idleTimer.unref?.();
+    };
+    const pause = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+    };
+    const resume = () => touch();
+    touch();
+    const abort = () => {
+      clearTimeout(headerTimer);
+      pause();
+      if (signal) signal.removeEventListener('abort', onClientAbort);
+      ctrl.abort();
+    };
+    return {
+      stream: res.body,
+      status: res.status,
+      contentType: res.headers.get('content-type'),
+      abort,
+      touch,
+      pause,
+      resume,
+      timedOut: () => abortReason,
+    };
   }
 
   return { listModels, chat, openStream, request };
@@ -374,12 +484,15 @@ export function upstreamError(r) {
   // 200 但 body 不是 JSON 属于"形状不对"，不是不可达，两者不能混为一谈。
   const rawStatus = Number.isInteger(r.status) ? r.status : 0;
   const transport = Boolean(r.transportError) || rawStatus === 0;
+  const timedOut = Boolean(r.timeout);
   const httpStatus = rawStatus >= 400 && rawStatus <= 599 ? rawStatus : null;
 
   const hit =
-    (transport
-      ? { code: 'apx_upstream_unreachable', hint: '上游不可达（超时或连接失败）' }
-      : null) ||
+    (timedOut
+      ? { code: 'apx_upstream_timeout', hint: '上游超时' }
+      : transport
+        ? { code: 'apx_upstream_unreachable', hint: '上游不可达（连接失败或被重置）' }
+        : null) ||
     map[reason] ||
     (httpStatus === 401
       ? { code: 'apx_upstream_unauthorized', hint: '上游拒绝凭证（可能已过期或被撤销）' }
@@ -392,7 +505,7 @@ export function upstreamError(r) {
   const retryAfter = retryAfterMs == null ? null : Math.max(1, Math.ceil(retryAfterMs / 1000));
 
   return {
-    status: transport ? 502 : httpStatus ?? 502,
+    status: timedOut ? 504 : transport ? 502 : (httpStatus ?? 502),
     code: hit.code,
     message: `${hit.hint}：${msg}`,
     upstream: { status: rawStatus, tag, reason, retryAfterMs, retryAfter },

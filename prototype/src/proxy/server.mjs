@@ -5,6 +5,7 @@ import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { errorEnvelope, newCompletionId } from '../adapters/translator.mjs';
 import { tokenMatches } from '../security/token.mjs';
+import { createLimiter } from '../runtime/limiter.mjs';
 
 function sendJson(res, status, obj, extraHeaders = {}) {
   const body = Buffer.from(JSON.stringify(obj));
@@ -75,7 +76,7 @@ function chunkFrame({ id, created, model, delta, finish = null }) {
     object: 'chat.completion.chunk',
     created,
     model,
-    choices: [{ index: 0, delta, finish_reason: finish }],
+    choices: [{ index: 0, delta, logprobs: null, finish_reason: finish }],
   };
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
@@ -129,11 +130,24 @@ async function pseudoStream(res, { text, message, finishReason = 'stop', model, 
   res.end();
 }
 
+/** 有界背压：客户端读得慢时等 drain，避免把整条流堆进内存。 */
+function waitForDrain(res) {
+  return new Promise((resolve) => {
+    const done = () => {
+      res.off('drain', done);
+      res.off('close', done);
+      resolve();
+    };
+    res.once('drain', done);
+    res.once('close', done);
+  });
+}
+
 /**
  * 真流式透传：二进制安全、逐块写出、不缓冲。
  * 客户端断开 → 立刻取消上游读取（不然上游继续生成，继续烧额度）。
  */
-async function pipeUpstreamStream(res, { stream, abort, stats }) {
+async function pipeUpstreamStream(res, { stream, abort, touch, pause, resume, timedOut, stats }) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache, no-transform',
@@ -158,11 +172,19 @@ async function pipeUpstreamStream(res, { stream, abort, stats }) {
     for (;;) {
       const { done, value } = await reader.read();
       if (done || closed) break;
+      touch?.();
       if (firstChunkAt === null) firstChunkAt = Date.now();
       const buf = Buffer.from(value);
       tail = (tail + buf.toString('latin1')).slice(-80);
       if (tail.includes('[DONE]')) sawDone = true;
-      res.write(buf); // Node 的 write 会立即 flush 到 socket
+      const ok = res.write(buf); // Node 的 write 会立即 flush 到 socket
+      if (!ok) {
+        // 客户端慢：先暂停「上游空闲超时」，等 drain 再恢复——
+        // 否则会把「下游读得慢」误判成「上游不吐数据」并取消一个健康的上游。
+        pause?.();
+        await waitForDrain(res);
+        resume?.();
+      }
     }
     if (!closed) {
       // 有的上游结尾不发 [DONE]，客户端会一直等
@@ -171,18 +193,46 @@ async function pipeUpstreamStream(res, { stream, abort, stats }) {
     }
   } catch (err) {
     if (!closed) {
-      res.write(`data: ${JSON.stringify({ error: { message: String(err.message || err), type: 'apx_error' } })}\n\n`);
+      const timeout = timedOut?.() || null;
+      const code = timeout ? 'apx_upstream_timeout' : 'apx_stream_error';
+      res.write(`data: ${JSON.stringify({ error: { message: String(err.message || err), type: 'apx_error', code } })}\n\n`);
       res.end();
     }
   } finally {
+    abort?.();
     stats.streams++;
     if (firstChunkAt) stats.ttfts.push(firstChunkAt - stats.lastStreamStart);
     if (stats.ttfts.length > 200) stats.ttfts.shift();
   }
 }
 
-/** Responses API 的 input → chat messages。只做 P0 需要的那几种形态。 */
-function responsesToMessages(body) {
+/** Responses 的 content 数组 → 文本。无法映射的类型显式记入 unsupported，不静默丢。 */
+function responsesContentToText(content, where, unsupported) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  content.forEach((p, i) => {
+    if (typeof p === 'string') {
+      parts.push(p);
+      return;
+    }
+    const type = p?.type;
+    if (type === 'input_text' || type === 'output_text' || type === 'text' || typeof p?.text === 'string') {
+      parts.push(p.text ?? '');
+      return;
+    }
+    unsupported.push(`${where}.content[${i}].type=${type || 'unknown'}`);
+  });
+  return parts.join('');
+}
+
+/**
+ * Responses API 的 input → Chat messages。
+ *
+ * 工具项必须还原成 Chat 的 assistant.tool_calls / role=tool，否则多轮工具调用会断链：
+ * 下游把 function_call_output 发回来，上游却看不到之前那次调用，模型就会重复调工具。
+ */
+function responsesToMessages(body, unsupported = []) {
   const messages = [];
   if (typeof body.instructions === 'string' && body.instructions.trim()) {
     messages.push({ role: 'system', content: body.instructions });
@@ -191,25 +241,92 @@ function responsesToMessages(body) {
   if (typeof input === 'string') {
     messages.push({ role: 'user', content: input });
   } else if (Array.isArray(input)) {
-    for (const item of input) {
+    input.forEach((item, i) => {
       if (typeof item === 'string') {
         messages.push({ role: 'user', content: item });
-        continue;
+        return;
       }
-      if (!item || typeof item !== 'object') continue;
-      // function_call / function_call_output 这类工具项：P0 不支持，跳过而不是崩掉
-      if (item.type && item.type !== 'message' && !item.role) continue;
-      const role = item.role || 'user';
-      let content = item.content;
-      if (Array.isArray(content)) {
-        content = content.map((p) => (typeof p === 'string' ? p : p?.text ?? p?.content ?? '')).join('');
-      } else if (typeof content !== 'string') {
-        content = '';
+      if (!item || typeof item !== 'object') {
+        unsupported.push(`input[${i}]`);
+        return;
       }
-      if (content) messages.push({ role, content });
-    }
+
+      const type = item.type || (item.role ? 'message' : null);
+      if (type === 'function_call') {
+        const call = {
+          id: item.call_id || item.id || `call_${i}`,
+          type: 'function',
+          function: {
+            name: item.name || '',
+            arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {}),
+          },
+        };
+        const last = messages.at(-1);
+        if (last?.role === 'assistant') {
+          last.tool_calls ||= [];
+          last.tool_calls.push(call);
+          if (last.content === undefined) last.content = null;
+        } else {
+          messages.push({ role: 'assistant', content: null, tool_calls: [call] });
+        }
+        return;
+      }
+      if (type === 'function_call_output') {
+        const callId = item.call_id || item.id || '';
+        if (!callId) {
+          unsupported.push(`input[${i}].call_id`);
+          return;
+        }
+        let output = item.output;
+        if (Array.isArray(output)) output = responsesContentToText(output, `input[${i}].output`, unsupported);
+        else if (typeof output !== 'string') output = output == null ? '' : JSON.stringify(output);
+        messages.push({ role: 'tool', tool_call_id: callId, content: output });
+        return;
+      }
+      if (type === 'message' || item.role) {
+        // Chat 的 developer 角色在部分上游不存在；developer 的语义就是 system。
+        const role = item.role === 'developer' ? 'system' : item.role || 'user';
+        const content = responsesContentToText(item.content, `input[${i}]`, unsupported);
+        if (content) messages.push({ role, content });
+        return;
+      }
+      // reasoning / item_reference / computer_call 等：没有 Chat 同构字段，显式拒绝。
+      unsupported.push(`input[${i}].type=${type || 'unknown'}`);
+    });
+  } else if (input !== undefined) {
+    unsupported.push('input');
   }
   return messages;
+}
+
+/** Responses 的 tools（扁平 {type,name,...}）→ Chat 的 tools（{type,function:{...}}）。 */
+function responsesToolsToChat(tools, unsupported) {
+  const out = [];
+  tools.forEach((t, i) => {
+    if (!t || t.type !== 'function' || !t.name) {
+      unsupported.push(`tools[${i}].type=${t?.type || 'unknown'}`);
+      return;
+    }
+    const fn = { name: t.name };
+    if (t.description !== undefined) fn.description = t.description;
+    if (t.parameters !== undefined) fn.parameters = t.parameters;
+    if (t.strict !== undefined) fn.strict = t.strict;
+    out.push({ type: 'function', function: fn });
+  });
+  return out;
+}
+
+function responsesToolChoiceToChat(choice, unsupported) {
+  if (typeof choice === 'string') {
+    if (choice === 'auto' || choice === 'none' || choice === 'required') return choice;
+    unsupported.push(`tool_choice=${choice}`);
+    return undefined;
+  }
+  if (choice && typeof choice === 'object' && choice.type === 'function' && typeof choice.name === 'string') {
+    return { type: 'function', function: { name: choice.name } };
+  }
+  unsupported.push('tool_choice');
+  return undefined;
 }
 
 function responsesUsage(usage) {
@@ -221,10 +338,54 @@ function responsesUsage(usage) {
   };
 }
 
+/** 把上游 assistant message 拆成 Responses 的 output items（message / function_call）。 */
+function responsesOutputItems({ id, message, text }) {
+  const items = [];
+  const contentText =
+    typeof message?.content === 'string'
+      ? message.content
+      : Array.isArray(message?.content)
+        ? message.content.map((p) => (typeof p === 'string' ? p : p?.text ?? '')).join('')
+        : typeof text === 'string'
+          ? text
+          : '';
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+  // 纯工具调用时 Responses 只回 function_call；普通回答保持至少一个 message item。
+  if (contentText || toolCalls.length === 0) {
+    items.push({
+      type: 'message',
+      id: `msg_${id.slice(5, 29)}`,
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: contentText, annotations: [] }],
+    });
+  }
+  for (const call of toolCalls) {
+    items.push({
+      type: 'function_call',
+      id: `fc_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      // call_id 必须沿用上游给的值：下一轮 function_call_output 靠它配对。
+      call_id: call.id || `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      name: call.function?.name || '',
+      arguments: typeof call.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call.function?.arguments ?? {}),
+      status: 'completed',
+    });
+  }
+  return { items, outputText: responsesOutputText(items) };
+}
+
+function responsesOutputText(items) {
+  return items
+    .filter((it) => it.type === 'message')
+    .map((it) => it.content.map((c) => c.text).join(''))
+    .join('');
+}
+
 function buildResponsesPayload({
   id,
   created,
   model,
+  message,
   text,
   usage,
   adapterId,
@@ -232,7 +393,16 @@ function buildResponsesPayload({
   instructions = null,
   temperature = null,
   topP = null,
+  tools = [],
+  toolChoice = 'auto',
+  parallelToolCalls = true,
+  // 流式回放时传入同一份 items，保证 response.completed 里的 item id
+  // 与前面 output_item.added / done 事件完全一致（客户端靠 id 配对）。
+  outputItems = null,
 }) {
+  const { items, outputText } = Array.isArray(outputItems)
+    ? { items: outputItems, outputText: responsesOutputText(outputItems) }
+    : responsesOutputItems({ id, message, text });
   return {
     id,
     object: 'response',
@@ -243,20 +413,12 @@ function buildResponsesPayload({
     instructions,
     metadata: {},
     model,
-    output: [
-      {
-        type: 'message',
-        id: `msg_${id.slice(5, 29)}`,
-        status: 'completed',
-        role: 'assistant',
-        content: [{ type: 'output_text', text, annotations: [] }],
-      },
-    ],
-    output_text: text,
-    parallel_tool_calls: true,
+    output: items,
+    output_text: outputText,
+    parallel_tool_calls: parallelToolCalls,
     temperature,
-    tool_choice: 'auto',
-    tools: [],
+    tool_choice: toolChoice,
+    tools,
     top_p: topP,
     usage: responsesUsage(usage),
     apx: { adapter: adapterId, usage_estimated: Boolean(estimated) },
@@ -266,12 +428,25 @@ function buildResponsesPayload({
 /**
  * Responses API 的流式事件。
  * 上游若只有非流式端点，这里按事件序列回放并标注 pseudo-stream——
- * 不假装上游原生支持增量，但保证客户端能拿到 output_text.delta。
+ * 不假装上游原生支持增量，但保证客户端能拿到 output_text.delta / function_call_arguments.delta。
  */
-async function responsesPseudoStream(res, { model, text, usage, adapterId, instructions = null, temperature = null, topP = null, chunkSize = 24, delayMs = 30 }) {
+async function responsesPseudoStream(res, {
+  model,
+  message,
+  text,
+  usage,
+  adapterId,
+  instructions = null,
+  temperature = null,
+  topP = null,
+  tools = [],
+  toolChoice = 'auto',
+  parallelToolCalls = true,
+  chunkSize = 24,
+  delayMs = 30,
+}) {
   const id = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
-  const msgId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache, no-transform',
@@ -287,28 +462,75 @@ async function responsesPseudoStream(res, { model, text, usage, adapterId, instr
     closed = true;
   });
 
-  emit({ type: 'response.created', response: { id, object: 'response', created_at: created, status: 'in_progress', model } });
-  emit({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: msgId, status: 'in_progress', role: 'assistant', content: [] } });
-  emit({ type: 'response.content_part.added', item_id: msgId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+  // 严格客户端（Coopanion 的 NativeResponseAssembly）要求**每个带 response 的事件**
+  // 都有 output 数组，包括 response.created。少了它会在第一个事件就抛
+  // "Invalid native Responses resource"——即使后续事件完全正确。
+  emit({
+    type: 'response.created',
+    response: { id, object: 'response', created_at: created, status: 'in_progress', model, output: [] },
+  });
 
-  for (let i = 0; i < text.length; i += chunkSize) {
+  const { items } = responsesOutputItems({ id, message, text });
+  for (let outputIndex = 0; outputIndex < items.length; outputIndex++) {
+    const item = items[outputIndex];
     if (closed) return;
-    emit({ type: 'response.output_text.delta', item_id: msgId, output_index: 0, content_index: 0, delta: text.slice(i, i + chunkSize) });
-    await new Promise((r) => setTimeout(r, delayMs));
+
+    if (item.type === 'message') {
+      const msgId = item.id;
+      const full = item.content[0]?.text || '';
+      emit({ type: 'response.output_item.added', output_index: outputIndex, item: { ...item, status: 'in_progress', content: [] } });
+      emit({ type: 'response.content_part.added', item_id: msgId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+      for (let i = 0; i < full.length; i += chunkSize) {
+        if (closed) return;
+        emit({ type: 'response.output_text.delta', item_id: msgId, output_index: outputIndex, content_index: 0, delta: full.slice(i, i + chunkSize) });
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+      if (closed) return;
+      emit({ type: 'response.output_text.done', item_id: msgId, output_index: outputIndex, content_index: 0, text: full });
+      emit({ type: 'response.content_part.done', item_id: msgId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: full, annotations: [] } });
+      emit({ type: 'response.output_item.done', output_index: outputIndex, item });
+      continue;
+    }
+
+    if (item.type === 'function_call') {
+      const args = item.arguments || '';
+      emit({ type: 'response.output_item.added', output_index: outputIndex, item: { ...item, status: 'in_progress', arguments: '' } });
+      for (let i = 0; i < args.length; i += chunkSize) {
+        if (closed) return;
+        emit({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: args.slice(i, i + chunkSize) });
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+      if (closed) return;
+      emit({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: args });
+      emit({ type: 'response.output_item.done', output_index: outputIndex, item });
+    }
   }
   if (closed) return;
 
-  emit({ type: 'response.output_text.done', item_id: msgId, output_index: 0, content_index: 0, text });
-  emit({ type: 'response.content_part.done', item_id: msgId, output_index: 0, content_index: 0, part: { type: 'output_text', text, annotations: [] } });
-  emit({ type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: msgId, status: 'completed', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] } });
   emit({
     type: 'response.completed',
-    response: buildResponsesPayload({ id, created, model, text, usage, adapterId, estimated: true, instructions, temperature, topP }),
+    response: buildResponsesPayload({
+      id,
+      created,
+      model,
+      message,
+      text,
+      usage,
+      adapterId,
+      estimated: true,
+      instructions,
+      temperature,
+      topP,
+      tools,
+      toolChoice,
+      parallelToolCalls,
+      outputItems: items,
+    }),
   });
   res.end();
 }
 
-export function createProxyServer({ host = '127.0.0.1', token, translator, adapter, getCatalog, credentials, authEnabled = true }) {
+export function createProxyServer({ host = '127.0.0.1', token, translator, adapter, getCatalog, credentials, authEnabled = true, limiter = createLimiter() }) {
   const stats = {
     startedAt: Date.now(),
     requests: 0,
@@ -318,6 +540,8 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
     ttfts: [],
     lastStreamStart: 0,
     byCode: {},
+    // 最近请求环形缓冲：给控制台定位「下游说格式不兼容」这类问题用。
+    recent: [],
   };
 
   const server = http.createServer(async (req, res) => {
@@ -353,10 +577,30 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
       stats.requests++;
       if (status >= 400) stats.errors++;
       stats.byCode[status] = (stats.byCode[status] || 0) + 1;
-      stats.latencies.push(Date.now() - t0);
+      const ms = Date.now() - t0;
+      stats.latencies.push(ms);
       if (stats.latencies.length > 500) stats.latencies.shift();
+      stats.recent.push({
+        at: new Date().toISOString(),
+        method: req.method,
+        path: url.pathname,
+        status,
+        ms,
+        model: req.apx?.model ?? null,
+        stream: Boolean(req.apx?.stream),
+        code: req.apx?.code ?? null,
+      });
+      if (stats.recent.length > 50) stats.recent.shift();
     };
 
+    // 客户端断开（Coopanion 的“抢占/取消”、用户关客户端）必须传到上游：
+    // 否则非流式请求会继续占着 Ollama 的唯一槽位，下一轮看起来像“没输出”。
+    const clientAbort = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) clientAbort.abort();
+    });
+
+    let slot = null;
     try {
       // 3) 健康检查：报告"凭证是否可读"比"进程活着"更有意义
       if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
@@ -372,6 +616,7 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
           credential: { kind: cred.kind, ok: cred.ok, hasToken: cred.hasToken, lastReadAt: cred.lastReadAt, expiresAt: cred.expiresAt },
           streaming: adapter.capabilities?.streaming ? 'passthrough' : 'pseudo',
           authEnabled,
+          concurrency: limiter.stats(),
           stats: {
             requests: stats.requests,
             errors: stats.errors,
@@ -439,37 +684,58 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
         try {
           body = JSON.parse(raw || '{}');
         } catch {
+          req.apx = { code: 'apx_bad_json' };
           done(400);
           return sendError(res, 400, { code: 'apx_bad_json', message: '请求体不是合法 JSON' });
         }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          req.apx = { code: 'apx_bad_request' };
+          done(400);
+          return sendError(res, 400, { code: 'apx_bad_request', message: '请求体必须是 JSON 对象', param: 'body' });
+        }
+        req.apx = { model: body.model ?? null, stream: Boolean(body.stream) };
         if (!Array.isArray(body.messages) || !body.messages.length) {
+          req.apx.code = 'apx_bad_request';
           done(400);
           return sendError(res, 400, { code: 'apx_bad_request', message: 'messages 不能为空', param: 'messages' });
         }
 
+        // 只有真正会打上游的请求才占并发槽；校验失败不排队。
+        slot = await limiter.acquire();
+
         if (body.stream) {
           stats.lastStreamStart = Date.now();
-          const s = await translator.openStream(body);
+          const s = await translator.openStream(body, { signal: clientAbort.signal });
           if (s.error) {
+            req.apx.code = s.error.code || null;
             done(s.error.status);
+            if (s.error.clientAborted) return;
             return sendError(res, s.error.status, s.error);
           }
           if (s.stream) {
             done(200);
-            return pipeUpstreamStream(res, { stream: s.stream, abort: s.abort, stats });
+            return await pipeUpstreamStream(res, { stream: s.stream, abort: s.abort, touch: s.touch, pause: s.pause, resume: s.resume, timedOut: s.timedOut, stats });
           }
           // 上游不支持真流式 → 先取完整结果，再伪流式回放
         }
 
-        const result = await translator.chat(body);
+        const result = await translator.chat(body, { signal: clientAbort.signal });
         if (result.error) {
+          req.apx.code = result.error.code || null;
           done(result.error.status);
+          if (result.error.clientAborted) return;
           return sendError(res, result.error.status, result.error);
         }
 
         if (body.stream) {
           done(200);
-          return pseudoStream(res, {
+          // 上游已经返回完整结果，伪流式只是在本地回放；提前还槽，
+          // 避免慢客户端占着上游并发名额。
+          if (slot) {
+            slot.release();
+            slot = null;
+          }
+          return await pseudoStream(res, {
             text: result.text,
             message: result.message,
             finishReason: result.finishReason || 'stop',
@@ -478,12 +744,16 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
         }
 
         done(200);
+        const message = assistantMessage(result);
+        // OpenAI 的 ChatCompletionMessage 带 refusal（可为 null），部分严格客户端会按 schema 校验。
+        if (!('refusal' in message)) message.refusal = null;
         return sendJson(res, 200, {
           id: newCompletionId(),
           object: 'chat.completion',
           created: Math.floor(Date.now() / 1000),
           model: body.model,
-          choices: [{ index: 0, message: assistantMessage(result), finish_reason: result.finishReason || 'stop' }],
+          // logprobs 是官方 schema 里的必填可空字段；缺了它，严格解析器会判"格式不兼容"。
+          choices: [{ index: 0, message, logprobs: null, finish_reason: result.finishReason || 'stop' }],
           // 有些客户端严格解析 usage 对象；上游没给就给 0，而不是让字段消失。
           usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
           system_fingerprint: null,
@@ -503,83 +773,106 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
         try {
           body = JSON.parse(raw || '{}');
         } catch {
+          req.apx = { code: 'apx_bad_json' };
           done(400);
           return sendError(res, 400, { code: 'apx_bad_json', message: '请求体不是合法 JSON' });
         }
-        const messages = responsesToMessages(body);
-        if (!messages.length) {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          req.apx = { code: 'apx_bad_request' };
           done(400);
-          return sendError(res, 400, {
-            code: 'apx_bad_request',
-            param: 'input',
-            message: 'input 不能为空（支持字符串，或 [{role, content}] 数组）',
-          });
+          return sendError(res, 400, { code: 'apx_bad_request', message: '请求体必须是 JSON 对象', param: 'body' });
         }
-        // Responses 的工具/多轮状态字段不是 Chat Completions 的同构字段；
-        // 静默丢掉会让 agent 拿残缺上下文，所以这里显式拒绝。
+        req.apx = { model: body.model ?? null, stream: Boolean(body.stream) };
+        // 先做完整校验再发上游：静默丢掉工具字段会让 agent 拿残缺上下文，
+        // 比直接 400 更难排查。
         const unsupported = [];
-        if (body.tools?.length) unsupported.push('tools');
-        if (body.tool_choice !== undefined) unsupported.push('tool_choice');
+        const messages = responsesToMessages(body, unsupported);
         if (body.previous_response_id) unsupported.push('previous_response_id');
-        if (Array.isArray(body.input) && body.input.some((x) => x?.type === 'function_call' || x?.type === 'function_call_output')) {
-          unsupported.push('input[*].function_call/function_call_output');
+
+        let chatTools;
+        if (body.tools !== undefined) {
+          if (Array.isArray(body.tools)) chatTools = responsesToolsToChat(body.tools, unsupported);
+          else unsupported.push('tools');
         }
+        let chatToolChoice;
+        if (body.tool_choice !== undefined) chatToolChoice = responsesToolChoiceToChat(body.tool_choice, unsupported);
+
         if (unsupported.length) {
+          req.apx.code = 'apx_unsupported_field';
           done(400);
           return sendError(res, 400, {
             code: 'apx_unsupported_field',
             param: unsupported[0],
-            message: `Responses API 暂不支持字段：${unsupported.join(', ')}。这是显式拒绝，不是静默忽略。`,
+            message: `Responses API 暂不支持：${unsupported.join(', ')}。这是显式拒绝，不是静默忽略。`,
           });
         }
+        if (!messages.length) {
+          req.apx.code = 'apx_bad_request';
+          done(400);
+          return sendError(res, 400, {
+            code: 'apx_bad_request',
+            param: 'input',
+            message: 'input 不能为空（支持字符串，或 message / function_call / function_call_output 数组）',
+          });
+        }
+
+        slot = await limiter.acquire();
 
         const chatBody = { model: body.model, messages, stream: false, max_tokens: body.max_output_tokens };
         for (const k of ['temperature', 'top_p', 'presence_penalty', 'frequency_penalty', 'user']) {
           if (body[k] !== undefined) chatBody[k] = body[k];
         }
+        if (chatTools?.length) chatBody.tools = chatTools;
+        if (chatToolChoice !== undefined) chatBody.tool_choice = chatToolChoice;
+        if (body.parallel_tool_calls !== undefined) chatBody.parallel_tool_calls = body.parallel_tool_calls;
+        // effort=none 等同于“不思考”，没必要给上游塞 reasoning_effort：
+        // 有些模型（如 qwen2.5:0.5b）看到这个字段会直接 400 does not support thinking。
+        if (body.reasoning && typeof body.reasoning === 'object' && body.reasoning.effort && body.reasoning.effort !== 'none') {
+          chatBody.reasoning_effort = body.reasoning.effort;
+        }
 
-        const result = await translator.chat(chatBody);
+        const result = await translator.chat(chatBody, { signal: clientAbort.signal });
         if (result.error) {
+          req.apx.code = result.error.code || null;
           done(result.error.status);
+          if (result.error.clientAborted) return;
           return sendError(res, result.error.status, result.error);
         }
 
         const id = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
         const created = Math.floor(Date.now() / 1000);
+        const responseTools = Array.isArray(body.tools) ? body.tools : [];
+        const responseToolChoice = body.tool_choice ?? 'auto';
+        const parallelToolCalls = body.parallel_tool_calls ?? true;
+        const common = {
+          model: body.model,
+          message: result.message,
+          text: result.text,
+          usage: result.usage,
+          adapterId: adapter.id,
+          instructions: typeof body.instructions === 'string' ? body.instructions : null,
+          temperature: body.temperature ?? null,
+          topP: body.top_p ?? null,
+          tools: responseTools,
+          toolChoice: responseToolChoice,
+          parallelToolCalls,
+        };
 
         if (body.stream) {
           done(200);
-          return responsesPseudoStream(res, {
-            model: body.model,
-            text: result.text,
-            usage: result.usage,
-            adapterId: adapter.id,
-            instructions: typeof body.instructions === 'string' ? body.instructions : null,
-            temperature: body.temperature ?? null,
-            topP: body.top_p ?? null,
-          });
+          if (slot) {
+            slot.release();
+            slot = null;
+          }
+          return await responsesPseudoStream(res, common);
         }
 
         done(200);
-        return sendJson(
-          res,
-          200,
-          buildResponsesPayload({
-            id,
-            created,
-            model: body.model,
-            text: result.text,
-            usage: result.usage,
-            adapterId: adapter.id,
-            estimated: result.usageEstimated,
-            instructions: typeof body.instructions === 'string' ? body.instructions : null,
-            temperature: body.temperature ?? null,
-            topP: body.top_p ?? null,
-          }),
-        );
+        return sendJson(res, 200, buildResponsesPayload({ id, created, estimated: result.usageEstimated, ...common }));
       }
 
       if (url.pathname.startsWith('/v1/')) {
+        req.apx = { ...(req.apx || {}), code: 'apx_unsupported_endpoint' };
         done(501);
         return sendError(res, 501, {
           code: 'apx_unsupported_endpoint',
@@ -590,14 +883,24 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
       done(404);
       return sendError(res, 404, { code: 'apx_not_found', message: '未找到该路径' });
     } catch (err) {
+      // 队列满/排队超时：快速失败，让客户端退避，而不是让它等一个必然超时的请求。
+      if (err?.code === 'apx_queue_full' || err?.code === 'apx_queue_timeout') {
+        req.apx = { ...(req.apx || {}), code: err.code };
+        done(err.status || 503);
+        return sendError(res, err.status || 503, err);
+      }
       // 客户端主动断开（语音打断 / Ctrl+C）会在这里冒出来，不算服务端错误
       if (res.destroyed || /aborted|ECONNRESET/i.test(String(err.message))) return;
       done(500);
       return sendError(res, 500, { code: 'apx_internal_error', message: String(err.message || err) });
+    } finally {
+      // 流式路径已 return await，槽位会一直占到流结束/断开。
+      if (slot) slot.release();
     }
   });
 
   server.stats = stats;
+  server.limiter = limiter;
   return server;
 }
 

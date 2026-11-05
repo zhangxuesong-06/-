@@ -41,6 +41,14 @@
     "vision": true,
     "embeddings": false
   },
+  "limits": {
+    "maxConcurrent": 4,
+    "maxQueue": 16,
+    "queueTimeoutMs": 30000,
+    "requestTimeoutMs": 120000,
+    "streamFirstByteTimeoutMs": 60000,
+    "streamIdleTimeoutMs": 120000
+  },
   "sessionPolicy": "stateless",
   "quirks": {
     "requiresUserSession": false,

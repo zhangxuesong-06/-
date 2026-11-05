@@ -33,7 +33,8 @@ function listen(server) {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-const state = { token: 'T1', failOnce: false, hits: [], authSeen: [] };
+const state = { token: 'T1', failOnce: false, hits: [], authSeen: [], lastBody: null, hangStarted: 0, hangClosed: 0 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function startFakeUpstream() {
   const server = http.createServer((req, res) => {
@@ -62,6 +63,7 @@ function startFakeUpstream() {
       req.on('data', (c) => (raw += c));
       req.on('end', async () => {
         const body = JSON.parse(raw || '{}');
+        state.lastBody = body;
         const lastMsg = body.messages?.at(-1)?.content || '';
         // 退避信号测试用的两个开关（只在本测试里出现，不影响正常分支）
         if (lastMsg.includes('__429_HEADER__')) {
@@ -83,6 +85,15 @@ function startFakeUpstream() {
         if (lastMsg.includes('__CLOSE__')) {
           // 模拟"连响应都没有"：直接掐断连接（超时/连接失败的等价情形）
           req.socket.destroy();
+          return;
+        }
+        if (lastMsg.includes('__HANG__')) {
+          // 上游收到后一直不返回：用来验证“客户端断开 → 上游请求被取消”。
+          state.hangStarted++;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.on('close', () => {
+            state.hangClosed++;
+          });
           return;
         }
         if (lastMsg.includes('__TOOL__')) {
@@ -295,6 +306,8 @@ async function main() {
     check('返回 200', r.status === 200, `实际 ${r.status}`);
     check('内容正确', j.choices?.[0]?.message?.content === 'echo:hi', JSON.stringify(j).slice(0, 160));
     check('usage 透传', Boolean(j.usage?.total_tokens), JSON.stringify(j.usage));
+    check('choices[0].logprobs 存在且为 null（官方 schema 必填可空）', j.choices?.[0]?.logprobs === null, JSON.stringify(j.choices?.[0]));
+    check('message.refusal 存在且为 null', j.choices?.[0]?.message?.refusal === null, JSON.stringify(j.choices?.[0]?.message));
   }
 
   console.log('[3b] 工具调用：非流式直通不能丢 tool_calls');
@@ -377,6 +390,7 @@ async function main() {
         check('tool_calls 在伪流式里仍存在', text.includes('"tool_calls"') && text.includes('get_weather'), text.slice(0, 300));
         check('函数参数完整回放', text.includes('{\\"city\\":\\"Shanghai\\"}'), text.slice(-400));
         check('finish_reason = tool_calls', text.includes('"finish_reason":"tool_calls"'), text.slice(-300));
+        check('伪流式 chunk 也带 logprobs:null', text.includes('"logprobs":null'), text.slice(0, 300));
         check('以 [DONE] 收尾', text.includes('data: [DONE]'));
       }
     } finally {
@@ -535,6 +549,32 @@ async function main() {
     check('上游掐断连接 → 下游 502', status === 502, String(status));
     check('code 标明是不可达而非上游业务错误', code === 'apx_upstream_unreachable', String(code));
   }
+  {
+    const r = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: auth,
+      body: 'null',
+    });
+    const j = await r.json().catch(() => null);
+    check('body=null 返回 400 而不是 500', r.status === 400 && j?.error?.code === 'apx_bad_request', `实际 ${r.status} ${JSON.stringify(j)}`);
+  }
+
+  console.log('[10b] 客户端断开会取消非流式上游（避免占住唯一上游槽位）');
+  {
+    const ac = new AbortController();
+    const p = fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: auth,
+      signal: ac.signal,
+      body: JSON.stringify({ model: 'fake-1', messages: [{ role: 'user', content: '__HANG__' }] }),
+    }).catch((e) => e);
+    await sleep(150);
+    check('上游已收到挂起请求', state.hangStarted >= 1, String(state.hangStarted));
+    ac.abort();
+    const closed = await waitFor(() => state.hangClosed >= 1, { timeout: 2000, interval: 50 });
+    check('客户端断开后上游连接被取消', Boolean(closed), String(state.hangClosed));
+    await p;
+  }
 
   console.log('[11] Responses API：/v1/responses 必须可用而不是 501');
   {
@@ -565,16 +605,113 @@ async function main() {
     const text = await r.text();
     check('有 output_text.delta 事件', text.includes('event: response.output_text.delta'));
     check('有 response.completed 事件', text.includes('event: response.completed'));
+    {
+      const createdLine = text.split('\n').find((l) => l.includes('"type":"response.created"'));
+      check('response.created 的 response 带 output 数组（严格客户端要求）', Boolean(createdLine && createdLine.includes('"output":[]')), createdLine || 'missing');
+    }
     check('无 [DONE]（Responses 用事件收尾，不用 Chat 的 [DONE]）', !text.includes('data: [DONE]'));
+  }
+  console.log('[11b] Responses API 工具调用：tools / function_call / function_call_output');
+  const toolDef = {
+    type: 'function',
+    name: 'get_weather',
+    description: 'get weather',
+    parameters: { type: 'object', properties: { city: { type: 'string' } } },
+    strict: true,
+  };
+  {
+    const r = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ model: 'fake-1', input: '__TOOL__', tools: [toolDef], tool_choice: 'auto', parallel_tool_calls: true }),
+    });
+    const j = await r.json().catch(() => null);
+    const fc = j?.output?.find((x) => x.type === 'function_call');
+    check('返回 200', r.status === 200, `实际 ${r.status} ${JSON.stringify(j).slice(0, 160)}`);
+    check('output 含 function_call', Boolean(fc), JSON.stringify(j?.output));
+    check('函数名与参数沿用上游', fc?.name === 'get_weather' && fc?.arguments === '{"city":"Shanghai"}', JSON.stringify(fc));
+    check('call_id 沿用上游（下一轮靠它配对）', fc?.call_id === 'call_1', String(fc?.call_id));
+    check('纯工具调用时 output_text 为空', j?.output_text === '', JSON.stringify(j?.output_text));
+    check('回显 tools / tool_choice', j?.tools?.[0]?.name === 'get_weather' && j?.tool_choice === 'auto', `${JSON.stringify(j?.tools)} ${JSON.stringify(j?.tool_choice)}`);
+    check('上游收到 Chat 形状 tools', state.lastBody?.tools?.[0]?.function?.name === 'get_weather', JSON.stringify(state.lastBody?.tools));
+    check('strict 一并透传', state.lastBody?.tools?.[0]?.function?.strict === true, JSON.stringify(state.lastBody?.tools?.[0]));
   }
   {
     const r = await fetch(`${base}/v1/responses`, {
       method: 'POST',
       headers: auth,
-      body: JSON.stringify({ model: 'fake-1', input: 'hi', tools: [{ type: 'function', name: 'x' }] }),
+      body: JSON.stringify({
+        model: 'fake-1',
+        input: [
+          { role: 'user', content: 'weather?' },
+          { type: 'function_call', call_id: 'call_9', name: 'get_weather', arguments: '{"city":"Paris"}' },
+          { type: 'function_call_output', call_id: 'call_9', output: '{"temp":20}' },
+        ],
+        tools: [toolDef],
+        tool_choice: { type: 'function', name: 'get_weather' },
+      }),
     });
     const j = await r.json().catch(() => null);
-    check('tools 显式 400，不静默丢弃', r.status === 400 && j?.error?.code === 'apx_unsupported_field', `实际 ${r.status} ${JSON.stringify(j)}`);
+    const msgs = state.lastBody?.messages || [];
+    const assistant = msgs.find((m) => m.role === 'assistant' && Array.isArray(m.tool_calls));
+    const toolMsg = msgs.find((m) => m.role === 'tool');
+    check('历史工具项请求返回 200', r.status === 200, `实际 ${r.status} ${JSON.stringify(j).slice(0, 160)}`);
+    check('assistant.tool_calls 被还原', assistant?.tool_calls?.[0]?.id === 'call_9' && assistant?.tool_calls?.[0]?.function?.name === 'get_weather', JSON.stringify(assistant));
+    check('工具结果按 call_id 配对', toolMsg?.tool_call_id === 'call_9' && toolMsg?.content === '{"temp":20}', JSON.stringify(toolMsg));
+    check('tool_choice 转成 Chat 形状', state.lastBody?.tool_choice?.function?.name === 'get_weather', JSON.stringify(state.lastBody?.tool_choice));
+  }
+  {
+    const r = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ model: 'fake-1', input: '__TOOL__', stream: true, tools: [toolDef] }),
+    });
+    const text = await r.text();
+    check('流式含 function_call_arguments.done', text.includes('event: response.function_call_arguments.done'), text.slice(0, 200));
+    check('流里能看到函数名', text.includes('"name":"get_weather"'), text.slice(0, 300));
+    check('流里参数完整', text.includes('{\\"city\\":\\"Shanghai\\"}'), text.slice(-400));
+    check('completed 事件里也有 function_call', text.includes('event: response.completed') && text.includes('"type":"function_call"'), text.slice(-400));
+    check('纯工具调用不伪造 output_text.delta', !text.includes('event: response.output_text.delta'));
+    {
+      const events = text
+        .split('\n')
+        .filter((l) => l.startsWith('data: '))
+        .map((l) => JSON.parse(l.slice(6)));
+      const done = events.find((e) => e.type === 'response.output_item.done' && e.item?.type === 'function_call');
+      const completed = events.find((e) => e.type === 'response.completed');
+      const fc = completed?.response?.output?.find((x) => x.type === 'function_call');
+      check('流事件与 completed 的 item id 一致', Boolean(done && fc) && done.item.id === fc.id, `${done?.item?.id} vs ${fc?.id}`);
+      check('两处 call_id 一致', Boolean(done && fc) && done.item.call_id === fc.call_id, `${done?.item?.call_id} vs ${fc?.call_id}`);
+      const seqs = events.map((e) => e.sequence_number);
+      check('sequence_number 严格递增（严格客户端会校验）', seqs.every((n, i) => Number.isInteger(n) && (i === 0 ? n >= 0 : n > seqs[i - 1])), seqs.join(','));
+    }
+  }
+  {
+    const r = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ model: 'fake-1', input: 'hi', tools: [{ type: 'web_search_preview' }] }),
+    });
+    const j = await r.json().catch(() => null);
+    check('不支持的内置工具类型显式 400', r.status === 400 && j?.error?.code === 'apx_unsupported_field', `实际 ${r.status} ${JSON.stringify(j)}`);
+  }
+  {
+    const r = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ model: 'fake-1', input: [{ type: 'reasoning', summary: [] }] }),
+    });
+    const j = await r.json().catch(() => null);
+    check('不支持的 input item 显式 400', r.status === 400 && j?.error?.code === 'apx_unsupported_field', `实际 ${r.status} ${JSON.stringify(j)}`);
+  }
+  {
+    const r = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ model: 'fake-1', input: 'hi', previous_response_id: 'resp_old' }),
+    });
+    const j = await r.json().catch(() => null);
+    check('previous_response_id 仍显式 400', r.status === 400 && j?.error?.param === 'previous_response_id', `实际 ${r.status} ${JSON.stringify(j)}`);
   }
   {
     const r = await fetch(`${base}/v1/nope`, { method: 'POST', headers: auth, body: '{}' });

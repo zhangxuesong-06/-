@@ -31,9 +31,27 @@ node src/cli.mjs serve --adapter opencode-v2            # 自起上游服务面�
 
 | 界面词 | 意思 |
 |---|---|
-| 左侧「本机软件」 | 这是**提供方候选**：本机真实装着/在跑的软件。点它会自动切到下方对应的适配器 |
-| 右下「提供方软件」 | 真正出模型回答的一端。端口扫描型不绑定单一软件，启动时会显示实际命中的进程名（例如 `ollama`） |
-| 「适配器」 | 连接这个提供方的说明书；没有适配器不代表软件不能用，只是 apx 还不知道它的专用协议 |
+| 左侧「本机软件候选」 | **发现层结果**：本机真实装着/在跑的软件。绿色 `可代理` = 有适配器；灰色 `仅发现` = apx 只知道它存在，还不知道怎么连它 |
+| 「接入方式（内置模板）」 | **适配器**。每个选项对应 `prototype/adapters/` 里的一份 JSON，所以名字是固定的；它不是“本机所有软件”的列表。新增软件 = 加一份 JSON |
+| 「提供方」 | 真正出模型回答的一端。端口扫描型不绑定单一软件，启动时会显示实际命中的进程名（例如 `ollama`）；点左侧候选会自动切到命中它的模板 |
+
+> **为什么左侧很多软件不能代理？** 候选 ≠ 可代理。GUI 应用通常没有本地 API，或者端口只返回网页兜底页（看起来 200，其实是 HTML）。只有 manifest 里描述了“怎么找、怎么鉴权、调哪个接口”的软件才能一键接入；其余软件仍可用「通用直通 + 手填端口」尝试，前提是它真的有 OpenAI 兼容端点。
+
+### 下游程序怎么填（最常见的问题）
+
+下游程序里只有三项，必须与运行横幅**逐字一致**：
+
+| 下游字段 | 填什么 |
+|---|---|
+| `baseURL` / `base_url` | `http://127.0.0.1:<port>/v1`（或去掉 `/v1`，两种都支持） |
+| `apiKey` / `api_key` | 运行横幅里的 `sk-local-…` 令牌（不是上游的 key） |
+| `model` | `/v1/models` 返回的 id，例如 `qwen2.5:0.5b`。**不能写 `gpt-4o` / `deepseek-chat` 之类别的名字** |
+
+如果模型名不一致，会返回 **404 `apx_model_not_found`**；如果下游调了未实现的端点（如 `/v1/completions`），会返回 **501**。控制台「最近请求」会显示每次请求的路径、模型、状态码与错误码，先看这里能最快定位“服务已应答但不兼容”。
+
+> Responses API（Codex、Coopanion 等）走 `POST /v1/responses`：已支持 `input` 的 message / function_call / function_call_output、`tools`、流式事件。严格客户端要求：**每个带 `response` 的事件（包括 `response.created`）都必须有 `output` 数组**，且 `response.completed` 的 output item id 必须与前面 `output_item.added/done` 一致。旧版本这两点缺一个，Coopanion 就会在第一个事件抛 `Invalid native Responses resource`，界面显示“服务已应答，但响应格式不兼容”。
+>
+> 例：Coopanion 的提供方类型选 `openai-responses-compat`，Base URL 填 `http://127.0.0.1:<port>/v1`，endpoint path 用默认 `/responses`，model 填 `/v1/models` 里的 id（如 `qwen2.5:0.5b`）。它的探针会走严格流式校验；若仍报不兼容，先看控制台「最近请求」里的状态码/错误码。
 
 > 兼容性：下游 baseURL 填 `http://127.0.0.1:<port>/v1` 或 `http://127.0.0.1:<port>` 都可以；`/models`、`/chat/completions`、`/responses` 都接受带或不带 `/v1` 的形式，`GET /v1/models/{id}` 也已支持。`usage` 始终是对象，`/v1/responses` 返回标准 `object=response` 与非空 `output_text`。OpenAI 兼容上游的 `tool_calls` 在非流式、真流式、伪流式三条路径上都会保留（见下方“工具调用”）。
 
@@ -96,6 +114,7 @@ prototype/
 │  │   ├─ supervisor.mjs       # 起进程、抓凭据、等就绪、杀进程树、选空闲端口
 │  │   ├─ portscan.mjs         # port-scan 策略：复用 L1 判据的端口命中判定
 │  │   ├─ proxyenv.mjs         # 上游代理变量策略 clear / inherit / custom
+│  │   ├─ limiter.mjs          # 并发槽 + 有界 FIFO 队列 + 排队超时（N7）
 │  │   ├─ procinfo.mjs         # 进程取证：exe 路径 + 启动时刻（供 stop 验身份）
 │  │   └─ stopguard.mjs        # apx stop 的安全回收：三条件不全满足就只清状态
 │  ├─ proxy/server.mjs         # OpenAI 端点（含 /v1/responses）、SSE 透传、伪流式、鉴权、CORS
@@ -108,14 +127,15 @@ prototype/
 │  ├─ deepseek-harness.json    # 远端型（experimental）：借 agent 凭据直连其中转
 │  └─ openai-passthrough.json  # 任意 OpenAI 兼容服务（L1 直通 / 冒烟夹具）
 ├─ test/
-│  ├─ smoke.mjs                # 70 项端到端断言（假上游 + 真代理进程 + 退避信号 + 5xx 保真 + Responses + 无 /v1 兼容 + tool_calls 三条路径 + 模型详情）
+│  ├─ smoke.mjs                # 99 项端到端断言（假上游 + 真代理进程 + 退避信号 + 5xx 保真 + Responses 工具调用 + 无 /v1 兼容 + tool_calls 三条路径 + 模型详情 + logprobs/refusal）
 │  ├─ probe.test.mjs           # 23–25 项分级断言（L1 判据收紧 + port-scan 共用同一判据）
 │  ├─ token.test.mjs           # 17 项令牌稳定性断言（原子写 / 损坏不覆盖 / rotate / 并发）
-│  ├─ translator.test.mjs      # 11 项适配层断言（流式能力校验 + tool_calls 保真 + 形状错误）
+│  ├─ translator.test.mjs      # 19 项适配层断言（流式能力校验 + tool_calls 保真 + 超时 504 + reasoning_effort 降级重试）
 │  ├─ health.test.mjs          # 8 项上游健康断言（启动检查 / 连续失败判红 / 恢复清零）
-│  ├─ console.test.mjs         # 54 项控制台断言（鉴权 / 跨站 / 起停 / 真模型 / 无明文 / 过滤契约）
+│  ├─ limiter.test.mjs         # 19 项并发/队列断言（FIFO / 队列满 503 / 排队超时 / 槽位生效）
+│  ├─ console.test.mjs         # 56 项控制台断言（鉴权 / 跨站 / 起停 / 真模型 / 无明文 / 过滤契约 / 并发统计 / 最近请求）
 │  ├─ stop-safety.mjs          # 17 项回收安全断言（pid 复用不得误杀）
-│  ├─ adapters.test.mjs        # 49 项 manifest 断言（策略声明 + 凭据机制 + 探活 + 噪声 exe）
+│  ├─ adapters.test.mjs        # 52 项 manifest 断言（策略声明 + 凭据机制 + 探活 + 噪声 exe + limits 校验）
 │  └─ e2e-real.mjs             # 17 项真实链路断言（真模型文本 + 首块延迟 + Responses + 提供方识别）
 └─ ...
 ```
@@ -150,9 +170,19 @@ manifest 只描述「是什么、怎么找、怎么连」，**不描述「怎么
                   "textPath": "$.data.text" }
   },
   "capabilities": { "streaming": false, "tools": false },
+  "limits": {
+    "maxConcurrent": 4,
+    "maxQueue": 16,
+    "queueTimeoutMs": 30000,
+    "requestTimeoutMs": 120000,
+    "streamFirstByteTimeoutMs": 60000,
+    "streamIdleTimeoutMs": 120000
+  },
   "sessionPolicy": "stateless"
 }
 ```
+
+`limits` 可省略，缺省值见下方「并发与超时」。字段写错（负数、字符串、0 并发）会在加载时直接报错，不会静默回退。
 
 字段含义与完整 schema 见 `../docs/03-architecture.md` §D.4。
 
@@ -218,7 +248,21 @@ manifest 只描述「是什么、怎么找、怎么连」，**不描述「怎么
 | 流式 + `tools` | `capabilities.streaming: false` | 先取完整结果，再按 OpenAI 流式约定回放：`tool_calls` 整块发出，`finish_reason: "tool_calls"`，响应头 `x-apx-degraded: pseudo-stream` |
 | 任意 | `capabilities.tools: false` | **400 `apx_unsupported_field`**，在触达上游之前拒绝（流式路径同样校验，不会偷偷塞给上游） |
 
-> Responses API 的 `tools` / `tool_choice` / `previous_response_id` 仍属未实现：显式 400，不静默丢字段。Chat Completions 的工具调用不受影响。
+**Responses API 的工具调用也已映射**（Codex 类客户端走这条）：
+
+| Responses 请求 | 映射到 Chat | 说明 |
+|---|---|---|
+| `tools: [{type:"function",name,description,parameters,strict}]` | `tools: [{type:"function",function:{...}}]` | 扁平 → 嵌套；`strict` 一并透传 |
+| `tool_choice: "auto"/"none"/"required"` | 原样 | 也支持 `{type:"function",name}` → `{type:"function",function:{name}}` |
+| `input` 里的 `{type:"function_call",call_id,name,arguments}` | `assistant.tool_calls[]` | 连续多个会合并进同一条 assistant 消息 |
+| `input` 里的 `{type:"function_call_output",call_id,output}` | `{role:"tool",tool_call_id,content}` | 靠 `call_id` 配对 |
+| `parallel_tool_calls` / `reasoning.effort` | 同名 / `reasoning_effort` | 有则透传 |
+
+响应侧会把上游 `tool_calls` 还原成 Responses 的 `output[] = [{type:"function_call", call_id, name, arguments, ...}]`；流式会发 `response.function_call_arguments.delta/done` 与 `response.output_item.done`。`call_id` 始终沿用上游值，保证下一轮 `function_call_output` 能接上。
+
+`reasoning.effort` 仅在不是 `none` 时转成 `reasoning_effort`。如果上游明确回 400 `does not support thinking`（例如 `qwen2.5:0.5b`），会**去掉该字段重试一次**，并在响应 `apx.degraded` 里如实标注 `reasoning_effort`——不会假装模型思考过。
+
+仍显式 `400 apx_unsupported_field` 的：`previous_response_id`（需要服务端保存响应状态）、`web_search` / `file_search` / `computer_use` 等内置工具、`reasoning` / `item_reference` 等无法同构映射的 input item、图片/文件内容块。不会静默丢弃。
 
 ## 上游健康（不是“进程活着就绿”）
 
@@ -231,6 +275,28 @@ manifest 只描述「是什么、怎么找、怎么连」，**不描述「怎么
 | `down` | 连续失败 ≥ 2 次，或自起型子进程已退出 | 红灯「上游异常」，横幅显示失败原因 |
 
 `/api/status` 返回 `upstreamHealth: {state, lastCheckAt, lastOkAt, consecutiveFailures, checks, lastError}`。恢复成功后状态自动回到 `ok` 且失败计数清零——不需要重启代理。测试可用环境变量缩短周期：`APX_HEALTH_INTERVAL_MS=200`。
+
+## 并发与超时（N7）
+
+本机上游常常是串行或低并发的。没有上限时，多个下游同时打过来会把它拖垮；失败会以「等 120 秒后超时」的形式出现，而不是「立刻告诉我忙」。
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `maxConcurrent` | 8 | 同时打上游的最大请求数 |
+| `maxQueue` | 32 | 排队上限；`0` = 不排队，满了立刻 503 |
+| `queueTimeoutMs` | 30000 | 排队最长等待；超时 503 |
+| `requestTimeoutMs` | 120000 | 非流式上游硬超时 |
+| `streamFirstByteTimeoutMs` | 60000 | 流式首字节超时（此时还没发响应头，可以回 504） |
+| `streamIdleTimeoutMs` | 120000 | 流式两块之间的空闲超时（已发 200，只能发 SSE error 事件） |
+
+行为：
+
+- 并发未满 → 立即放行；满了 → FIFO 排队；队列满/排队超时 → **503**，`code` 分别为 `apx_queue_full` / `apx_queue_timeout`，带 `retry-after: 1`，客户端可立刻退避。
+- 上游超时 → **504 `apx_upstream_timeout`**（不再和“连接被拒”共用 502）。流式首字节超时同样 504；流中空闲超时会在 SSE 里发 `{error:{code:"apx_upstream_timeout"}}` 后结束。
+- 伪流式（上游已返回完整结果）会在开始回放前**提前释放并发槽**，慢客户端不会占着上游名额。
+- 真流式写下游时带背压：客户端读得慢就等 `drain`，不会把整条流堆进内存。
+- **客户端断开 → 取消上游**：不仅流式，非流式 `/chat/completions` 和 `/responses` 也会把断连信号传给上游。Coopanion 这类会“抢占上一轮”的客户端，不会再让被取消的请求继续占着 Ollama 的唯一槽位（表现为下一轮等 50–70 秒才开始）。控制台里会记为 499 / `apx_client_aborted`，这是正常抢占，不是故障。
+- `/health` 与 `/api/status` 都返回 `concurrency: {active, queued, maxConcurrent, admitted, rejected, timedOut, p95WaitMs…}`，控制台运行横幅显示「并发 x/y · 排队 n」。
 
 ## 令牌管理
 
@@ -271,6 +337,7 @@ node src/cli.mjs token rotate   # 更换（唯一入口，旧值立即失效）
 | 凭证轮换免重启 / 401 重读重放 | ✅ 测试覆盖 |
 | 停止即回收（进程树 + 端口） | ✅ 实测三个端口拒绝连接 |
 | **上游健康监控（N5）** | ✅ 8 项断言：启动即检查；连续 2 次失败判 `down`；恢复后回 `ok` 且计数清零；自起型子进程退出直接判 `down` |
+| **并发上限 + 有界队列 + 超时（N7）** | ✅ 19 项断言：FIFO 排队、队列满快速 `503 apx_queue_full`（带 `retry-after`）、排队超时 `apx_queue_timeout`、上游最大在途数受控；非流式/流式首字节超时 `504 apx_upstream_timeout` |
 | **`apx stop` 不误杀**（pid 复用防护） | ✅ 17 项断言：exe 路径不符 / 启动时间不符一律跳过，只清状态 |
 | **凭证型适配器（regex-file + remote）** | ✅ 38 项断言：凭据能读到（不打印明文）、`/v1/models` 实测 200；`chat` 仍 502，已在 manifest 如实标注 |
 | `opencode-v2` 真实模型文本 | ⚠️ 未达成：上游 provider 回 `This model is not available in your country`（地区限制）/ 曾出现免费额度 429 |
@@ -278,8 +345,9 @@ node src/cli.mjs token rotate   # 更换（唯一入口，旧值立即失效）
 | macOS / Linux 发现层 | ❌ 未实现（POSIX 分支为占位） |
 | **`tool_calls`（OpenAI 兼容上游）** | ✅ P1 直通：非流式保留 `message`（`content:null` + `tool_calls` + 非标字段）与 `finish_reason`；真流式增量透传；伪流式整块回放并标 `x-apx-degraded: pseudo-stream`。声明 `tools:false` 的适配器仍在流式/非流式两条路径显式 400 |
 | **`GET /v1/models/{id}`** | ✅ 支持（OpenAI SDK 的 `client.models.retrieve()`）；未知模型 404 `apx_model_not_found` |
-| Responses API 的 `tools` / `function_call` | ⚠️ 未实现：显式 400，不静默丢字段（Chat Completions 的工具调用不受影响） |
-| **`/v1/responses` 兼容层** | ✅ 字符串 / 数组 `input`、`instructions`、非流式与流式均有断言；流式按 Responses 事件回放并标注 `x-apx-degraded: pseudo-stream`。未实现端点返回 501 且列出已支持端点，不静默 404 |
+| **Responses API 工具调用** | ✅ `tools` / `tool_choice` / `parallel_tool_calls` / `function_call` / `function_call_output` 全链路映射；`call_id` 保持可配对；流式有 `function_call_arguments.delta/done` 事件。内置工具类型与 `previous_response_id` 仍显式 400 |
+| **`/v1/responses` 兼容层** | ✅ 字符串 / 数组 `input`、`instructions`、工具调用、非流式与流式均有断言；流式按 Responses 事件回放并标注 `x-apx-degraded: pseudo-stream`。未实现端点返回 501 且列出已支持端点，不静默 404 |
+| **Coopanion（严格 Responses 客户端）** | ✅ 用它的 `NativeResponseAssembly` + `ResponseAccumulator` 实际代码逐条复验：`response.created` 带 `output:[]`、事件类型、`sequence_number` 严格递增、`output_item` id、`completed` 与已关闭 item 一致性全部通过 |
 
 ---
 
@@ -302,7 +370,7 @@ GET  /api/adapters     适配器清单 + 每个适配器的匹配结果
 GET  /api/probe?port=N L0–L3 分级 + 假绿证据
 POST /api/start        {adapterId, upstreamPort?} → controller.start
 POST /api/stop         controller.stop
-GET  /api/status       运行态：端口、模型、凭证、上游健康（upstreamHealth）、请求数/P95/streaming
+GET  /api/status       运行态：端口、模型、凭证、上游健康（upstreamHealth）、并发、最近请求（recentRequests）、请求数/P95/streaming
 GET  /api/snippet      {baseURL, apiKey, models[]} 供复制
 ```
 
@@ -329,18 +397,19 @@ GET  /api/snippet      {baseURL, apiKey, models[]} 供复制
 
 ```bash
 cd prototype
-node test/smoke.mjs        # 70/70：假上游 + 真代理进程（鉴权/流式/凭证/重放/健康检查/429·503 Retry-After/5xx 保真/Responses/无 /v1 兼容/tool_calls 直通与伪流式/模型详情）
+node test/smoke.mjs        # 99/99：假上游 + 真代理进程（鉴权/流式/凭证/重放/健康检查/429·503 Retry-After/5xx 保真/Responses/无 /v1 兼容/tool_calls 直通与伪流式/模型详情/logprobs·refusal）
 node test/probe.test.mjs   # 23–25/25：L0–L3 分级 + port-scan 命中判据（含两个假阳回归）
 node test/token.test.mjs   # 17/17：令牌不得被意外轮换（原子写/损坏抛错/rotate/8 进程并发）
-node test/translator.test.mjs # 11/11：流式路径也必须执行能力校验；tool_calls / reasoning_content 不得丢
+node test/translator.test.mjs # 19/19：流式能力校验 / tool_calls 保真 / 非流式与流式首字节超时 504 / 非推理模型去掉 reasoning_effort 重试
 node test/health.test.mjs  # 8/8：上游健康（启动检查 / 连续 2 次失败判红 / 恢复后清零）
-node test/console.test.mjs # 54/54：控制台（401/403/起停/真模型/无明文/令牌稳定/默认视图一致/空候选可启动）；无本机上游则 skip
+node test/limiter.test.mjs # 19/19：并发上限 / FIFO / 队列满快速 503 / 排队超时 / 槽位真的限制在途数
+node test/console.test.mjs # 56/56：控制台（401/403/起停/真模型/无明文/令牌稳定/默认视图一致/空候选可启动/并发统计/最近请求）；无本机上游则 skip
 node test/stop-safety.mjs  # 17/17：apx stop 的 pid 复用防护（无关进程不得被杀）
-node test/adapters.test.mjs# 49/49：manifest 加载/策略声明/regex-file 凭据/远端探活/噪声 exe 排除（不可用则 skip）
+node test/adapters.test.mjs# 52/52（另 2 项外部依赖 skip）：manifest/策略/regex-file 凭据（真实文件不可用自动换夹具）/远端探活/噪声 exe/limits 校验
 node test/e2e-real.mjs     # 17/17：controller 直连本机推理服务（真文本 + 首块 < 3s + Responses + 提供方识别）；无上游则 skip
 ```
 
-一条命令跑全部：`npm run test:all`（等价于上面九条按顺序执行，共 266 项）。
+一条命令跑全部：`npm run test:all`（等价于上面十条按顺序执行，共 327 项）。
 
 每个套件都会把状态目录隔离到自己的临时目录（`APX_STATE_DIR`），跑完自动清理——所以并行验收不会互相踩 `~/.apx/state.json`。要指定目录（例如排查问题时保留现场）：`APX_STATE_DIR=/path/to/dir npm run test:all`。
 

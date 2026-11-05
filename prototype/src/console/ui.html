@@ -144,6 +144,17 @@
   .cand .meta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; }
   .cand .run-on { color: var(--ok); }
   .cand .run-off { color: var(--muted); }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 999px; font-size: 10px; line-height: 16px; border: 1px solid var(--line); }
+  .badge.ok { color: var(--ok); border-color: #2e6b47; background: var(--ok-bg); }
+  .badge.muted { color: var(--muted); }
+  .pane-help { padding: 8px 12px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--line); background: #11151d; line-height: 1.55; }
+  .pane-help b { color: var(--fg2); }
+  .req-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
+  .req-table th, .req-table td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .req-table th { color: var(--muted); font-weight: 500; }
+  .req-table td.ok { color: var(--ok); }
+  .req-table td.err { color: var(--err); }
+  .req-table .path { font-family: var(--mono); }
 
   /* ---------- 详情 ---------- */
   section.card { padding: 14px 16px; border-bottom: 1px solid var(--line); }
@@ -225,7 +236,7 @@
   <div class="brand">apx 控制台<span>本机模型端点</span></div>
   <button id="btn-rescan">重新扫描</button>
   <input type="text" id="filter" placeholder="按名称筛选" style="width:150px">
-  <label class="check" title="只显示被某个适配器命中的软件；关闭后可看到全部候选（含系统进程）"><input type="checkbox" id="only-matched" checked> 只看已适配软件<span class="muted-sm" id="matched-count"></span></label>
+  <label class="check" title="只显示被某个适配器命中的软件；关闭后可看到全部候选（含系统进程）"><input type="checkbox" id="only-matched" checked> 只看可代理（有适配器）<span class="muted-sm" id="matched-count"></span></label>
   <label class="check"><input type="checkbox" id="show-all"> 显示全部（含低置信）</label>
   <div class="grow"></div>
   <div class="light" id="light"><span class="dot"></span><span id="light-text">未运行</span></div>
@@ -255,7 +266,10 @@
 
 <main>
   <aside>
-    <div class="pane-head"><span id="list-count">本机软件 0</span><span class="grow"></span><span id="list-note">置信度 ≥ 0.85</span></div>
+    <div class="pane-head"><span id="list-count">本机软件候选 0</span><span class="grow"></span><span id="list-note">置信度 ≥ 0.85</span></div>
+    <div class="pane-help">
+      <b>发现 ≠ 能代理。</b>这里只是「装了/在跑」的软件。带 <span class="badge ok">可代理</span> 的才有适配器；<span class="badge muted">仅发现</span> 表示 apx 还不知道怎么连它（GUI 应用通常没有 API，或有网页兜底）。
+    </div>
     <div class="list" id="list"><div class="empty">加载中…</div></div>
   </aside>
 
@@ -267,6 +281,11 @@
       <div class="banner-line"><span class="k">model</span><span class="v" id="r-model"></span><button class="tiny" data-copy="r-model">复制</button></div>
       <div class="stats" id="r-stats"></div>
       <div class="hint">下游可调用 <code>POST /v1/chat/completions</code> 或 <code>POST /v1/responses</code>；未实现的接口会明确返回 501，不会静默忽略。</div>
+      <div class="hint">
+        <b>下游怎么填：</b>baseURL / apiKey / model 三项必须分别与上面三行<b>完全一致</b>。最常见的问题是 model 仍写着别的名字（例如 <code>gpt-4o</code>、<code>deepseek-chat</code>）——那会返回 404，最近请求里能看到 <code>apx_model_not_found</code>。
+      </div>
+      <div class="hint" style="margin-top:12px">最近请求（下游打进来的真实请求；状态码/错误码能定位“格式不兼容”）</div>
+      <div id="recent-requests"></div>
       <div class="row" style="margin-top:10px">
         <input type="text" id="model-search" placeholder="搜索模型" style="width:180px">
         <span class="hint" id="model-count"></span>
@@ -281,16 +300,16 @@
     </section>
 
     <section class="card" id="adapter-card">
-      <h2>选择提供方软件<span class="sub" id="adapter-sub"></span></h2>
+      <h2>选择接入方式（适配器）<span class="sub" id="adapter-sub"></span></h2>
       <div class="hint" id="adapter-provider" style="margin-bottom:8px; color:var(--fg)"></div>
       <div class="hint" style="margin-bottom:8px">
-        <b>提供方</b>是真正出模型回答的本机软件或服务；<b>适配器</b>是 apx 连接它所需的说明书：去哪找、如何鉴权、调用哪个接口、如何转成 OpenAI 格式。<br>
-        点左侧候选软件会自动切到对应适配器；端口扫描型不绑定某个软件，会连接它探到的本机服务。<br>
-        新增同类软件通常只需在 <code>prototype/adapters/</code> 放一份 JSON；遇到新协议则还需要对应的转换代码。
+        <b>“接入方式”不是本机软件列表，而是 apx 自带的连接模板。</b>每个选项对应 <code>prototype/adapters/</code> 里的一份 JSON，所以名字是固定的；新增一款软件 = 加一份 JSON，不是在这里临时输入软件名。<br>
+        <b>提供方</b>（真正出模型的那一端）由上面的选项决定：可能是本机推理服务、某个 agent 的自起服务面，或它已经配置好的远端通道。<br>
+        左侧点候选软件只会切换到“已命中”的模板；没有模板的软件只能显示「仅发现」。
       </div>
       <div class="row">
-        <label for="adapter-select" class="hint" style="margin:0">提供方软件 / 接入方式</label>
-        <select id="adapter-select" style="min-width:280px"></select>
+        <label for="adapter-select" class="hint" style="margin:0">接入方式（内置模板）</label>
+        <select id="adapter-select" style="min-width:320px"></select>
         <span id="port-wrap" style="display:none">
           <input type="number" id="upstream-port" placeholder="上游端口" style="width:110px">
         </span>
@@ -421,7 +440,7 @@
   function renderList() {
     const all = S.candidates.length;
     const shown = visibleCandidates();
-    $('#list-count').textContent = '本机软件 ' + shown.length + ' / ' + all;
+    $('#list-count').textContent = '本机软件候选 ' + shown.length + ' / ' + all;
     $('#matched-count').textContent = '（' + S.matchedTotal + ' / ' + all + '）';
     $('#list-note').textContent = S.onlyMatched
       ? '只看已适配（' + S.matchedTotal + '）'
@@ -451,11 +470,13 @@
     $('#list').innerHTML = shown.map((c) => {
       const ports = (c.ports || []).map((p) => p.port).join(',') || '无端口';
       const sel = c.id === S.selectedId ? ' sel' : '';
+      const canProxy = (c.matchedBy || []).length > 0;
       const matched = (c.matchedBy || []).map((id) => '<span class="chip hit">' + esc(id) + '</span>').join('');
       return '<div class="cand' + sel + '" data-id="' + esc(c.id) + '">' +
         '<div class="name">' + esc(c.name || '(未命名)') + '</div>' +
         '<div class="conf">' + Number(c.confidence || 0).toFixed(2) + '</div>' +
         '<div class="meta">' +
+          '<span class="badge ' + (canProxy ? 'ok' : 'muted') + '">' + (canProxy ? '可代理' : '仅发现') + '</span>' +
           '<span class="' + (c.running ? 'run-on' : 'run-off') + '">' + (c.running ? '● 运行' : '○ 停止') + '</span>' +
           '<span>v' + esc(c.version || '-') + '</span>' +
           '<span class="mono">' + esc(ports) + '</span>' +
@@ -510,12 +531,13 @@
       const a = S.adapters.find((x) => x.id === id);
       return a ? (a.name || id) : id;
     });
-    const proxyWay = matchedNames.length
-      ? '可代理：' + esc(matchedNames.join('、')) + '（已自动选到下方）'
-      : '暂无匹配适配器；仍可用下方「自动端口扫描」或「手动端口」接入';
-    const providerHint = matchedNames.length
+    const canProxy = matchedNames.length > 0;
+    const proxyWay = canProxy
+      ? '<span class="badge ok">可代理</span> ' + esc(matchedNames.join('、')) + '（已自动选到下方）'
+      : '<span class="badge muted">仅发现</span> 没有匹配的适配器，所以不能一键代理——这不是软件坏了';
+    const providerHint = canProxy
       ? '这个软件就是提供方；点下方「启动代理」会通过它的适配器接入。'
-      : '这个软件还没写适配器，所以不能一键代理；可以先用通用端口接入。';
+      : '候选只说明 apx 发现了安装/进程，不代表它有可用的本地 API。GUI 应用通常没有 API，或者端口只返回网页兜底页。可以先用「探测可代理性」确认；如果它确实有 OpenAI 兼容端口，再用「通用直通」手动接入。';
 
     $('#detail').innerHTML =
       '<h2>' + esc(c.name || '(未命名)') + '<span class="sub">置信度 ' + Number(c.confidence || 0).toFixed(2) + ' · ' + (c.running ? '运行中' : '未运行') + '</span></h2>' +
@@ -530,12 +552,15 @@
       '</dl>' +
       '<div class="row" style="margin-top:12px">' +
         '<button class="primary" id="btn-probe"' + (ports.length ? '' : ' disabled') + '>探测可代理性</button>' +
+        (!canProxy && ports.length ? '<button id="btn-use-generic">用通用直通接入端口 ' + esc(ports[0]) + '</button>' : '') +
         '<span class="hint">点端口号可以单独探测该端口</span>' +
       '</div>' +
       '<div id="probe-result"></div>';
 
     const btn = $('#btn-probe');
     if (btn) btn.addEventListener('click', () => runProbe(ports[0]));
+    const generic = $('#btn-use-generic');
+    if (generic) generic.addEventListener('click', () => useGenericPort(ports[0]));
     Array.from($('#detail').querySelectorAll('[data-probe]')).forEach((n) => {
       n.addEventListener('click', () => runProbe(Number(n.getAttribute('data-probe'))));
     });
@@ -665,6 +690,20 @@
     return '本机软件：当前未识别到（适配器仍可尝试自起服务面）';
   }
 
+  // 候选没有专用适配器，但确实监听着端口：走通用 OpenAI 直通，手动填端口。
+  function useGenericPort(port) {
+    if (!port) return;
+    S.adapterId = 'openai-passthrough';
+    S.upstreamPort = String(port);
+    renderAdapterOptions();
+    const input = $('#upstream-port');
+    if (input) input.value = String(port);
+    renderAdapterMeta();
+    const card = $('#adapter-card');
+    if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    toast('已切到「任意 OpenAI 兼容服务（直通）」，端口 ' + port + '；确认后点「启动代理」', 'ok');
+  }
+
   function renderAdapterOptions() {
     const sel = $('#adapter-select');
     if (!S.adapters.length) { sel.innerHTML = '<option value="">（没有可用适配器）</option>'; return; }
@@ -675,17 +714,19 @@
                      S.adapters[0];
       S.adapterId = prefer.id;
     }
+    const kindOf = (a) => {
+      const s = a.serviceFace?.strategy;
+      if (s === 'port-scan') return '自动扫端口';
+      if (s === 'launch-assigned') return '自起服务面';
+      if (s === 'remote') return '远端凭据';
+      if (s === 'listen-scan' || s === 'static') return '手动端口';
+      return '其他方式';
+    };
     sel.innerHTML = S.adapters.map((a) => {
       const hits = (a.hits || []).map((h) => h.name).join(' / ');
-      const tail = hits
-        ? ' — ' + hits
-        : a.serviceFace?.strategy === 'port-scan'
-          ? ' — 自动找本机服务'
-          : a.serviceFace?.strategy === 'remote'
-            ? ' — 远端通道'
-            : ' — 手动端口';
+      const tail = hits ? ' — ' + hits : '';
       return '<option value="' + esc(a.id) + '"' + (a.id === S.adapterId ? ' selected' : '') + '>' +
-        esc(a.name + tail) + '</option>';
+        esc(kindOf(a) + ' · ' + a.name + tail) + '</option>';
     }).join('');
     renderAdapterMeta();
   }
@@ -825,6 +866,48 @@
     }
   }
 
+  function requestCodeHint(code) {
+    return ({
+      apx_model_not_found: '下游填的 model 与 /v1/models 返回的 id 不一致',
+      apx_unsupported_field: '下游带了当前适配器不支持的字段（如 tools）',
+      apx_unsupported_endpoint: '下游调了未实现的端点（如 /v1/completions）',
+      apx_upstream_timeout: '上游超时',
+      apx_upstream_unreachable: '连不上上游',
+      apx_upstream_rate_limited: '上游限流/额度不足',
+      apx_queue_full: '并发与队列已满',
+      apx_queue_timeout: '排队超时',
+      apx_bad_json: '请求体不是合法 JSON',
+      apx_bad_request: '请求字段缺失或形状不对',
+      apx_client_aborted: '下游已断开，apx 已取消上游（Coopanion 抢占时会出现，属正常）',
+    })[code] || '';
+  }
+
+  function renderRecentRequests(st) {
+    const box = $('#recent-requests');
+    if (!box) return;
+    const rows = (st.recentRequests || []).slice().reverse().slice(0, 10);
+    if (!rows.length) {
+      box.innerHTML = '<div class="hint">还没有请求。下游调用一次后会出现在这里。</div>';
+      return;
+    }
+    box.innerHTML =
+      '<table class="req-table"><thead><tr><th>时间</th><th>接口</th><th>模型</th><th>流</th><th>状态</th><th>耗时</th><th>错误码</th></tr></thead><tbody>' +
+      rows.map((r) => {
+        const ok = Number(r.status) < 400;
+        const t = r.at ? new Date(r.at).toLocaleTimeString('zh-CN', { hour12: false }) : '-';
+        return '<tr>' +
+          '<td>' + esc(t) + '</td>' +
+          '<td class="path">' + esc(r.path || '') + '</td>' +
+          '<td class="path">' + esc(r.model || '-') + '</td>' +
+          '<td>' + (r.stream ? '是' : '否') + '</td>' +
+          '<td class="' + (ok ? 'ok' : 'err') + '">' + esc(r.status) + '</td>' +
+          '<td>' + esc(r.ms == null ? '-' : r.ms + ' ms') + '</td>' +
+          '<td class="' + (r.code ? 'err' : '') + '" title="' + esc(requestCodeHint(r.code)) + '">' + esc(r.code || '-') + '</td>' +
+        '</tr>';
+      }).join('') +
+      '</tbody></table>';
+  }
+
   function renderRunning() {
     const st = S.status;
     const box = $('#running');
@@ -849,8 +932,10 @@
     const first = (st.models && st.models[0] && st.models[0].alias) || '（模型清单为空）';
     $('#r-model').textContent = first;
     const s = st.stats || {};
+    const c = st.concurrency || {};
     $('#r-stats').innerHTML =
       '<span>请求 ' + (s.requests || 0) + '</span>' +
+      '<span>并发 ' + (c.active || 0) + '/' + (c.maxConcurrent || '-') + ' · 排队 ' + (c.queued || 0) + '</span>' +
       '<span>错误 ' + (s.errors || 0) + '</span>' +
       '<span>P95 ' + (s.p95Ms == null ? '-' : s.p95Ms + ' ms') + '</span>' +
       '<span>流式 ' + esc(st.streaming) + '</span>' +
@@ -859,6 +944,7 @@
       '<span title="' + esc(h.lastError || '最近一次探测正常') + '">上游健康 ' + esc(hLabel) + '（连续失败 ' + (h.consecutiveFailures || 0) + ' 次）</span>';
     renderFlow();
     renderModels();
+    renderRecentRequests(st);
   }
 
   async function poll() {

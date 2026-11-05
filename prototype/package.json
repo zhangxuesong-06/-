@@ -16,8 +16,9 @@
     "test:adapters": "node test/adapters.test.mjs",
     "test:translator": "node test/translator.test.mjs",
     "test:health": "node test/health.test.mjs",
+    "test:limiter": "node test/limiter.test.mjs",
     "test:e2e": "node test/e2e-real.mjs",
-    "test:all": "node test/smoke.mjs && node test/probe.test.mjs && node test/token.test.mjs && node test/translator.test.mjs && node test/health.test.mjs && node test/console.test.mjs && node test/stop-safety.mjs && node test/adapters.test.mjs && node test/e2e-real.mjs"
+    "test:all": "node test/smoke.mjs && node test/probe.test.mjs && node test/token.test.mjs && node test/translator.test.mjs && node test/health.test.mjs && node test/limiter.test.mjs && node test/console.test.mjs && node test/stop-safety.mjs && node test/adapters.test.mjs && node test/e2e-real.mjs"
   },
   "engines": { "node": ">=18" }
 }

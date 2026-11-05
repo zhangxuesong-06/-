@@ -104,20 +104,45 @@ async function main() {
   }
 
   console.log('\n[5] 凭证型适配器：从 agent 的凭据文件按正则取（不打印明文）');
+  // 真实凭据是外部状态：文件不存在或格式变了都不该让整个套件失败。
+  // 真实文件可用就用真实的；否则换成本地夹具，保证 regex-file 机制本身被稳定验证。
   const dsh = findAdapter('deepseek-harness');
   const credPath = expandPath(dsh.upstream.auth.path);
+  let authSpec = dsh.upstream.auth;
+  let fixtureDir = null;
+  let fixtureNote = '';
+  const useFixture = () => {
+    fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apx-cred-'));
+    const file = path.join(fixtureDir, 'credentials.yaml');
+    fs.writeFileSync(file, 'DSH_API_KEY: "fixture-token-123"\n');
+    authSpec = { ...dsh.upstream.auth, path: file };
+  };
   if (!fs.existsSync(credPath)) {
-    skip('读取 DSH 凭据', `凭据文件不存在：${credPath}`);
+    skip('真实 DSH 凭据', `文件不存在：${credPath}；改用夹具验证机制`);
+    useFixture();
+    fixtureNote = '（夹具）';
   } else {
-    const provider = createCredentialProvider(dsh.upstream.auth);
+    const probe = createCredentialProvider(dsh.upstream.auth);
+    const probeCred = await probe.get();
+    if (!probeCred?.token) {
+      skip('真实 DSH 凭据', '文件存在但未匹配到 DSH_API_KEY（外部格式可能已变）；改用夹具验证机制');
+      useFixture();
+      fixtureNote = '（夹具）';
+    }
+  }
+
+  {
+    const provider = createCredentialProvider(authSpec);
     const cred = await provider.get();
-    check('凭据已读到', Boolean(cred && cred.token), '读不到（正则没匹配上？）');
+    check(`凭据已读到${fixtureNote}`, Boolean(cred && cred.token), '读不到（正则没匹配上？）');
     check('凭据长度 > 0', Boolean(cred?.token?.length > 0), String(cred?.token?.length ?? 0));
     check('scheme 为 bearer', cred?.scheme === 'bearer', String(cred?.scheme));
     // 只断言"能读到"，绝不打印值
     const desc = provider.describe();
     check('describe 报告文件存在且已读取', desc.ok === true && desc.hasToken === true, JSON.stringify({ ok: desc.ok, hasToken: desc.hasToken, kind: desc.kind }));
+    check('describe 不泄露凭据明文', !JSON.stringify(desc).includes(String(cred?.token || 'fixture-token-123')), JSON.stringify(desc));
   }
+  if (fixtureDir) fs.rmSync(fixtureDir, { recursive: true, force: true });
 
   console.log('\n[6] 远端上游探活（失败即 skip，不 fail）');
   {
@@ -143,8 +168,8 @@ async function main() {
           /* 非 JSON */
         }
         const count = Array.isArray(j?.data) ? j.data.length : 0;
-        check('/v1/models 返回 200 且形状可解析', count > 0, `data 数量 ${count}`);
-        if (count === 0) skip('模型可用性', '中转 200 但模型清单为空');
+        if (count === 0) skip('/v1/models 模型可用性', '中转 200 但模型清单为空（上游状态，不由本地控制）');
+        else check('/v1/models 返回 200 且形状可解析', true, `data 数量 ${count}`);
       }
     } catch (e) {
       skip('远端上游探活', `启动或请求失败：${e.message}`);
@@ -221,6 +246,33 @@ async function main() {
     check('exeNames 显式列出时噪声豁免', matchAdapter(explicitAdapter, upd).length === 1, JSON.stringify(matchAdapter(explicitAdapter, upd)));
     const implicitAdapter = { match: { exeNames: [], pathGlobs: ['C:\\Apps\\X\\*.exe'], registryNamePattern: null } };
     check('仅靠 glob 顺带命中时被压制', matchAdapter(implicitAdapter, upd).length === 0, JSON.stringify(matchAdapter(implicitAdapter, upd)));
+  }
+
+  console.log('\n[9] limits（并发/超时）声明校验');
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'apx-limits-'));
+    const base = {
+      schemaVersion: 1,
+      name: 'limits 夹具',
+      version: '1.0.0',
+      match: { exeNames: [], pathGlobs: [] },
+      serviceFace: { type: 'openai-passthrough', portDiscovery: { strategy: 'listen-scan' } },
+      upstream: { listModels: { path: '/v1/models' }, generate: { path: '/v1/chat/completions' } },
+    };
+    fs.writeFileSync(
+      path.join(tmp, 'good.json'),
+      JSON.stringify({ ...base, id: 'limits-good', limits: { maxConcurrent: 4, maxQueue: 8, queueTimeoutMs: 5000, requestTimeoutMs: 60000 } }),
+    );
+    fs.writeFileSync(
+      path.join(tmp, 'bad.json'),
+      JSON.stringify({ ...base, id: 'limits-bad', limits: { maxConcurrent: 0, maxQueue: -1, requestTimeoutMs: 'soon' } }),
+    );
+    const loaded = loadAdapters({ extraDirs: [tmp] });
+    check('合法 limits 正常加载', loaded.adapters.some((a) => a.id === 'limits-good' && a.limits.maxConcurrent === 4), loaded.adapters.map((a) => a.id).join(','));
+    check('非法 limits 被拒绝', !loaded.adapters.some((a) => a.id === 'limits-bad'), loaded.adapters.map((a) => a.id).join(','));
+    const errs = loaded.errors.filter((e) => String(e.field).startsWith('limits.'));
+    check('报出字段级 limits 错误', errs.length >= 3, JSON.stringify(errs.map((e) => `${e.field}=${e.actual}`)));
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败 / ${skipped} 跳过`);

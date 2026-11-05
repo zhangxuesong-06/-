@@ -17,6 +17,7 @@ import { createCredentialProvider } from '../security/credentials.mjs';
 import { portScanEndpoints } from './portscan.mjs';
 import { describeProxyPolicy } from './proxyenv.mjs';
 import { getProcessInfo } from './procinfo.mjs';
+import { createLimiter } from './limiter.mjs';
 
 const DEFAULT_PROXY_PORT = 8787;
 const CATALOG_TTL_MS = 30000;
@@ -257,6 +258,13 @@ export function createController({
     const adapter = findAdapter(adapterId);
     if (!adapter) throw apxError(`未找到适配器 ${adapterId}（先跑 \`apx list\` 看可用适配器）`, 2);
 
+    const limits = adapter.limits || {};
+    const limiter = createLimiter({
+      maxConcurrent: limits.maxConcurrent,
+      maxQueue: limits.maxQueue,
+      queueTimeoutMs: limits.queueTimeoutMs,
+    });
+
     const token = getToken();
     const up = await resolveUpstream({ adapter, upstreamPort, servicePort, timeoutMs });
 
@@ -299,6 +307,7 @@ export function createController({
       getCatalog,
       credentials: up.credentials,
       authEnabled,
+      limiter,
     });
 
     await new Promise((resolve, reject) => {
@@ -342,6 +351,7 @@ export function createController({
       streaming: adapter.capabilities?.streaming ? 'passthrough' : 'pseudo',
       proxyEnv,
       health,
+      limiter,
       startedAt: new Date().toISOString(),
     };
 
@@ -498,6 +508,9 @@ export function createController({
             lastError: s.health.lastError,
           }
         : null,
+      concurrency: s.limiter?.stats?.() || null,
+      // 定位「下游说响应格式不兼容」时，先看它到底打了哪个端点、拿到的状态码与错误码。
+      recentRequests: (s.server.stats?.recent || []).slice(-15),
       stats: {
         requests: st.requests || 0,
         errors: st.errors || 0,

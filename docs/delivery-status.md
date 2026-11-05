@@ -131,3 +131,41 @@ node src/cli.mjs ui            # 控制台按 Ctrl+C
 | 回归 | `node test/smoke.mjs` 70/70；`node test/translator.test.mjs` 11/11；`node test/health.test.mjs` 8/8；其余套件不变（probe 23、token 17、console 54、stop 17、adapters 49、e2e-real 17），合计 **266 / 0 失败** |
 | 显式未做 | Responses API 的 `tools` / `tool_choice` / `previous_response_id` / `function_call` 仍是 400；声明式映射型适配器（如 `opencode-v2`）没有工具调用概念，也仍显式 400 |
 | 复现 | `cd prototype && node test/smoke.mjs && node test/translator.test.mjs` |
+
+---
+
+## 7. 工程侧增量 2（2026-11-04 晚，**待 QA 复验**）
+
+| 项 | 内容 |
+|---|---|
+| 变更 | 打通 Responses API 工具调用：`tools`（扁平 → Chat 嵌套）、`tool_choice`、`parallel_tool_calls`、`reasoning.effort`；`input` 里的 `function_call` → `assistant.tool_calls`、`function_call_output` → `role=tool`（按 `call_id` 配对）；上游 `tool_calls` → Responses `output[].function_call`，流式发 `function_call_arguments.delta/done` 与 `output_item.done`。`response.completed` 与前面的流事件共用同一份 output items（item id 一致） |
+| 显式拒绝（仍 400） | `previous_response_id`；`web_search` / `file_search` / `computer_use` 等内置工具；`reasoning` / `item_reference` 等无法同构的 input item；图片/文件内容块 |
+| 改动文件 | `src/proxy/server.mjs`、`test/smoke.mjs`、`README.md` |
+| 回归 | `node test/smoke.mjs` 91/91；其余套件不变（probe 23、token 17、translator 11、health 8、console 54、stop 17、adapters 49、e2e-real 17），合计 **287 / 0 失败** |
+| 复现 | `cd prototype && node test/smoke.mjs`（看 `[11b] Responses API 工具调用`） |
+
+---
+
+## 8. 工程侧增量 3（2026-11-04 晚，**待 QA 复验**）
+
+| 项 | 内容 |
+|---|---|
+| 变更 | N7 落地：① `runtime/limiter.mjs` 并发槽 + 有界 FIFO 队列 + 排队超时；② 队列满/超时返回 `503 apx_queue_full` / `apx_queue_timeout`（`retry-after: 1`，不再让客户端干等）；③ 非流式硬超时 `504 apx_upstream_timeout`，流式补首字节 60s / 空闲 120s 超时；④ manifest 新增 `limits` 并校验；⑤ `/health`、`/api/status` 暴露 `concurrency`，控制台显示「并发 x/y · 排队 n」；⑥ 伪流式回放前提前释放槽位，慢客户端不占上游名额 |
+| 关键语义 | 超时与"连接被拒"分开：超时 504，连不上 502。流式已发 200 后无法改状态码，空闲超时以 SSE `{error:{code:"apx_upstream_timeout"}}` 收尾——这是 HTTP 协议限制，不是降级 |
+| 改动文件 | `src/runtime/limiter.mjs`（新增）、`src/runtime/controller.mjs`、`src/adapters/translator.mjs`、`src/adapters/loader.mjs`、`src/proxy/server.mjs`、`src/console/ui.html`、4 个内置 manifest、`test/limiter.test.mjs`（新增）、`test/translator.test.mjs`、`test/adapters.test.mjs`、`test/console.test.mjs`、`package.json`、`README.md` |
+| 回归 | smoke 91、probe 23、token 17、translator 15、health 8、limiter 19、console 55、stop 17、adapters 52、e2e-real 17，合计 **314 / 0 失败** |
+| 复现 | `cd prototype && node test/limiter.test.mjs && node test/translator.test.mjs` |
+
+---
+
+## 9. 工程侧增量 4（2026-11-04 晚，**待 QA 复验**）
+
+| 项 | 内容 |
+|---|---|
+| 界面语义 | 左侧改为「本机软件候选」，每行标注 `可代理` / `仅发现`；明确“候选 ≠ 可代理”，并解释 GUI 应用无 API / 网页兜底页。原「提供方软件 / 接入方式」拆开：下拉改为「接入方式（内置模板）」，说明模板来自 `prototype/adapters/*.json`、名字固定；「提供方」单独显示实际命中的软件。无适配器但有端口的候选新增「用通用直通接入端口 N」按钮 |
+| 诊断能力 | `/api/status` 新增 `recentRequests`（最近 50 条，UI 展示最近 10 条）：时间、路径、model、是否流式、状态码、耗时、错误码；错误码带中文提示（如 `apx_model_not_found` = model 名不一致）。定位“请求增加但下游说格式不兼容”时先看这里 |
+| 响应字段加固 | 非流式 Chat 补 `choices[].logprobs: null` 与 `message.refusal: null`（官方 schema 必填可空字段，缺失会被严格客户端判格式不兼容）；伪流式 chunk 同样补 `logprobs`。`reasoning.effort=none` 不再下传；上游明确报 `does not support thinking` 时去掉 `reasoning_effort` 重试一次，并标 `apx.degraded` |
+| 断连取消 | 客户端断开（Coopanion 抢占上一轮）时，`/chat/completions` 与 `/responses` 的非流式上游请求也会被取消，立即释放上游槽位；`recentRequests` 记录 499 `apx_client_aborted` |
+| 下游实测 | 用 Coopanion（`openai-responses-compat`）的真实 `NativeResponseAssembly` + `ResponseAccumulator` 代码逐条校验 `/v1/responses` 流，全部通过。其「服务已应答，但响应格式不兼容」的**实际根因**：`response.created` 的 response 对象缺 `output` 数组 → `NativeResponseAssembly.feed()` 在第一个事件就抛 `Invalid native Responses resource`（已补 `output: []`）。其次是旧版本 `response.completed` 重新生成 item id（已修），以及 baseURL/model 仍指向旧代理/旧模型名 |
+| 改动文件 | `src/proxy/server.mjs`、`src/runtime/controller.mjs`、`src/adapters/translator.mjs`、`src/console/ui.html`、`test/smoke.mjs`、`test/console.test.mjs`、`README.md` |
+| 回归 | smoke 99、probe 23、token 17、translator 19、health 8、limiter 19、console 56、stop 17、adapters 52（另 2 项外部依赖 skip）、e2e-real 17，合计 **327 / 0 失败** |
