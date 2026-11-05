@@ -154,6 +154,7 @@
   .req-table th { color: var(--muted); font-weight: 500; }
   .req-table td.ok { color: var(--ok); }
   .req-table td.err { color: var(--err); }
+  .req-table td.warn { color: var(--warn); }
   .req-table .path { font-family: var(--mono); }
 
   /* ---------- 详情 ---------- */
@@ -891,7 +892,7 @@
       return;
     }
     box.innerHTML =
-      '<table class="req-table"><thead><tr><th>时间</th><th>接口</th><th>模型</th><th>流</th><th>状态</th><th>耗时</th><th>错误码</th></tr></thead><tbody>' +
+      '<table class="req-table"><thead><tr><th>时间</th><th>接口</th><th>模型</th><th>流</th><th>输入</th><th>状态</th><th>耗时</th><th>错误码</th></tr></thead><tbody>' +
       rows.map((r) => {
         const ok = Number(r.status) < 400;
         const t = r.at ? new Date(r.at).toLocaleTimeString('zh-CN', { hour12: false }) : '-';
@@ -900,6 +901,7 @@
           '<td class="path">' + esc(r.path || '') + '</td>' +
           '<td class="path">' + esc(r.model || '-') + '</td>' +
           '<td>' + (r.stream ? '是' : '否') + '</td>' +
+          '<td class="' + (r.inputChars > 12000 ? 'warn' : '') + '" title="' + esc((r.messages ?? '?') + ' 条 / ' + (r.tools || 0) + ' 个工具' + (r.inputChars > 12000 ? '；输入很大，Ollama 默认上下文可能截断最新消息' : '')) + '">' + esc(r.inputChars ? Math.round(r.inputChars / 1000) + 'k 字符' : '-') + '</td>' +
           '<td class="' + (ok ? 'ok' : 'err') + '">' + esc(r.status) + '</td>' +
           '<td>' + esc(r.ms == null ? '-' : r.ms + ' ms') + '</td>' +
           '<td class="' + (r.code ? 'err' : '') + '" title="' + esc(requestCodeHint(r.code)) + '">' + esc(r.code || '-') + '</td>' +

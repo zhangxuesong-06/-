@@ -588,6 +588,9 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
         ms,
         model: req.apx?.model ?? null,
         stream: Boolean(req.apx?.stream),
+        inputChars: req.apx?.inputChars ?? null,
+        messages: req.apx?.messages ?? null,
+        tools: req.apx?.tools ?? null,
         code: req.apx?.code ?? null,
       });
       if (stats.recent.length > 50) stats.recent.shift();
@@ -693,7 +696,13 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
           done(400);
           return sendError(res, 400, { code: 'apx_bad_request', message: '请求体必须是 JSON 对象', param: 'body' });
         }
-        req.apx = { model: body.model ?? null, stream: Boolean(body.stream) };
+        req.apx = {
+          model: body.model ?? null,
+          stream: Boolean(body.stream),
+          inputChars: raw.length,
+          messages: Array.isArray(body.messages) ? body.messages.length : 0,
+          tools: Array.isArray(body.tools) ? body.tools.length : 0,
+        };
         if (!Array.isArray(body.messages) || !body.messages.length) {
           req.apx.code = 'apx_bad_request';
           done(400);
@@ -782,7 +791,13 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
           done(400);
           return sendError(res, 400, { code: 'apx_bad_request', message: '请求体必须是 JSON 对象', param: 'body' });
         }
-        req.apx = { model: body.model ?? null, stream: Boolean(body.stream) };
+        req.apx = {
+          model: body.model ?? null,
+          stream: Boolean(body.stream),
+          inputChars: raw.length,
+          messages: Array.isArray(body.input) ? body.input.length : 1,
+          tools: Array.isArray(body.tools) ? body.tools.length : 0,
+        };
         // 先做完整校验再发上游：静默丢掉工具字段会让 agent 拿残缺上下文，
         // 比直接 400 更难排查。
         const unsupported = [];

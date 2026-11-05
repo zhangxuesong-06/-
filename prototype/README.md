@@ -47,7 +47,7 @@ node src/cli.mjs serve --adapter opencode-v2            # 自起上游服务面�
 | `apiKey` / `api_key` | 运行横幅里的 `sk-local-…` 令牌（不是上游的 key） |
 | `model` | `/v1/models` 返回的 id，例如 `qwen2.5:0.5b`。**不能写 `gpt-4o` / `deepseek-chat` 之类别的名字** |
 
-如果模型名不一致，会返回 **404 `apx_model_not_found`**；如果下游调了未实现的端点（如 `/v1/completions`），会返回 **501**。控制台「最近请求」会显示每次请求的路径、模型、状态码与错误码，先看这里能最快定位“服务已应答但不兼容”。
+如果模型名不一致，会返回 **404 `apx_model_not_found`**；如果下游调了未实现的端点（如 `/v1/completions`），会返回 **501**。控制台「最近请求」会显示每次请求的路径、模型、输入大小（字符数 / 条数 / 工具数）、状态码与错误码，先看这里能最快定位“服务已应答但不兼容”。输入超过 12k 字符会标黄提醒——Ollama 默认上下文可能截断。
 
 > Responses API（Codex、Coopanion 等）走 `POST /v1/responses`：已支持 `input` 的 message / function_call / function_call_output、`tools`、流式事件。严格客户端要求：**每个带 `response` 的事件（包括 `response.created`）都必须有 `output` 数组**，且 `response.completed` 的 output item id 必须与前面 `output_item.added/done` 一致。旧版本这两点缺一个，Coopanion 就会在第一个事件抛 `Invalid native Responses resource`，界面显示“服务已应答，但响应格式不兼容”。
 >
@@ -295,7 +295,7 @@ manifest 只描述「是什么、怎么找、怎么连」，**不描述「怎么
 - 上游超时 → **504 `apx_upstream_timeout`**（不再和“连接被拒”共用 502）。流式首字节超时同样 504；流中空闲超时会在 SSE 里发 `{error:{code:"apx_upstream_timeout"}}` 后结束。
 - 伪流式（上游已返回完整结果）会在开始回放前**提前释放并发槽**，慢客户端不会占着上游名额。
 - 真流式写下游时带背压：客户端读得慢就等 `drain`，不会把整条流堆进内存。
-- **客户端断开 → 取消上游**：不仅流式，非流式 `/chat/completions` 和 `/responses` 也会把断连信号传给上游。Coopanion 这类会“抢占上一轮”的客户端，不会再让被取消的请求继续占着 Ollama 的唯一槽位（表现为下一轮等 50–70 秒才开始）。控制台里会记为 499 / `apx_client_aborted`，这是正常抢占，不是故障。
+- **客户端断开 → 取消上游**：不仅流式，非流式 `/chat/completions` 和 `/responses` 也会把断连信号传给上游。Coopanion 这类会“抢占上一轮”的客户端，不会再让被取消的请求继续占着 Ollama 的唯一槽位（表现为下一轮等 50–70 秒才开始）。控制台里会记为 499 / `apx_client_aborted`，这是正常抢占，不是故障。实测：长请求发出 500ms 后取消，紧接着的短请求 **881ms** 完成。
 - `/health` 与 `/api/status` 都返回 `concurrency: {active, queued, maxConcurrent, admitted, rejected, timedOut, p95WaitMs…}`，控制台运行横幅显示「并发 x/y · 排队 n」。
 
 ## 令牌管理
@@ -358,6 +358,7 @@ node src/cli.mjs token rotate   # 更换（唯一入口，旧值立即失效）
 3. **伪流式不是真流式**：`x-apx-degraded: pseudo-stream` 会明确标注。
 4. **`usage` 是估算值**（声明式映射型），响应里带 `usage_estimated: true`。
 5. **合规**：把某些上游的订阅额度开放给任意本机程序，可能触及该服务的条款（例如"仅供 coding agent 使用"）。这类判断要在 UI 上说清楚，不能只报"能跑"。
+6. **Ollama 默认上下文只有 4096**：超长 prompt 会被上游截断（日志 `truncating input prompt`），表现为人设/旧记忆丢失或回复跑偏。请求里的 `num_ctx` / `options.num_ctx` 会被 Ollama 的 OpenAI 端点忽略（实测）；要改必须在启动 Ollama 前设环境变量（例如 `OLLAMA_CONTEXT_LENGTH=16384`）或改模型 Modelfile。控制台「最近请求」会把超过 12k 字符的输入标黄提醒。
 
 ---
 
