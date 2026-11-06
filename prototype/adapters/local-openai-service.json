@@ -50,7 +50,14 @@
     "queueTimeoutMs": 30000,
     "requestTimeoutMs": 120000,
     "streamFirstByteTimeoutMs": 60000,
-    "streamIdleTimeoutMs": 120000
+    "streamIdleTimeoutMs": 120000,
+    "maxInputChars": 4200,
+    "maxTools": 5,
+    "textToTool": {
+      "tool": "pet_say",
+      "argument": "script",
+      "maxChars": 400
+    }
   },
   "sessionPolicy": "stateless",
   "quirks": {
@@ -59,7 +66,8 @@
       "serviceFace.proxyEnv 默认是 clear：spawn / 连接上游时清掉 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY（大小写两套）并设置 NO_PROXY=127.0.0.1,localhost,::1。本机开着系统代理时，不清掉会得到 502 ERR_PROXY_TUNNEL: Proxy refused to open a tunnel，表现为「上游明明活着却连不上」。上游需要走代理出公网时改成 inherit。",
       "port-scan 的命中判据不是状态码，而是 GET /v1/models 返回 JSON 且含 data[].id：HTML 兜底页同样返回 200，只看状态码会误判为可用。",
       "候选端口 11434 / 1234 / 8080 / 8000 只写在这份 manifest 里，主程序不含任何端口或厂商硬编码；换端口只改这里。",
-      "上游若不是标准 OpenAI 形状（例如 items 不在 $.data、文本不在 $.choices[0].message.content），需要另写一份 manifest，不要改主程序。"
+      "上游若不是标准 OpenAI 形状（例如 items 不在 $.data、文本不在 $.choices[0].message.content），需要另写一份 manifest，不要改主程序。",
+      "limits.maxInputChars=4200 / maxTools=5 是给本地小模型做的上下文预算：只保留系统提示 + 最近消息 + 最近用到的 5 个工具；超出会在响应 apx.degraded 里标注 messages_trimmed / tools_trimmed。要带完整上下文就把这两个值调大或设为 0（不裁剪），但 Ollama 默认 4096 上下文仍会截断。"
     ]
   }
 }

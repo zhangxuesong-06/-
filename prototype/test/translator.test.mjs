@@ -161,6 +161,26 @@ async function main() {
     check('返回 502 apx_upstream_shape_mismatch', r.error?.status === 502 && r.error?.code === 'apx_upstream_shape_mismatch', JSON.stringify(r.error));
   }
 
+  console.log('\n[4b] 上下文预算：保留系统提示 + 最近消息 + 限量工具');
+  {
+    const old = Array.from({ length: 20 }, (_, i) => ({ role: 'user', content: `旧消息${i}-` + '背景'.repeat(200) }));
+    const t = makeTranslator(baseUrl, { tools: true, limits: { maxInputChars: 2000, maxTools: 1 } });
+    const before = seen.length;
+    const r = await t.chat({
+      model: 'fake-1',
+      messages: [{ role: 'system', content: 'SYS-KEEP' }, ...old, { role: 'user', content: 'LATEST-KEEP' }],
+      tools: [{ type: 'function', function: { name: 'a' } }, { type: 'function', function: { name: 'b' } }, { type: 'function', function: { name: 'c' } }],
+    });
+    const sent = seen.at(-1) || {};
+    check('裁剪后仍成功调用', Boolean(r.message), JSON.stringify(r).slice(0, 160));
+    check('系统提示保留', sent.messages?.[0]?.content === 'SYS-KEEP', JSON.stringify(sent.messages?.[0]).slice(0, 120));
+    check('最后一条用户消息保留', sent.messages?.at(-1)?.content === 'LATEST-KEEP', JSON.stringify(sent.messages?.at(-1)).slice(0, 120));
+    check('旧消息被裁掉', (sent.messages || []).length < old.length + 2, `消息数 ${(sent.messages || []).length}`);
+    check('工具按上限裁剪', (sent.tools || []).length === 1, JSON.stringify((sent.tools || []).map((x) => x.function?.name)));
+    check('降级信息如实标注', (r.apxDegraded || []).some((x) => String(x).startsWith('messages_trimmed=')) && (r.apxDegraded || []).some((x) => String(x).startsWith('tools_trimmed=')), JSON.stringify(r.apxDegraded));
+    check('确实只发了一次上游请求', seen.length - before === 1, String(seen.length - before));
+  }
+
   console.log('\n[5] 非流式硬超时 → 504 apx_upstream_timeout');
   {
     const t = makeTranslator(baseUrl, { tools: true, limits: { requestTimeoutMs: 60 } });

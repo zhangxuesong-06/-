@@ -127,10 +127,10 @@ prototype/
 │  ├─ deepseek-harness.json    # 远端型（experimental）：借 agent 凭据直连其中转
 │  └─ openai-passthrough.json  # 任意 OpenAI 兼容服务（L1 直通 / 冒烟夹具）
 ├─ test/
-│  ├─ smoke.mjs                # 99 项端到端断言（假上游 + 真代理进程 + 退避信号 + 5xx 保真 + Responses 工具调用 + 无 /v1 兼容 + tool_calls 三条路径 + 模型详情 + logprobs/refusal）
+│  ├─ smoke.mjs                # 107 项端到端断言（假上游 + 真代理进程 + 退避信号 + 5xx 保真 + Responses 工具调用 + 无 /v1 兼容 + tool_calls 三条路径 + 模型详情 + logprobs/refusal）
 │  ├─ probe.test.mjs           # 23–25 项分级断言（L1 判据收紧 + port-scan 共用同一判据）
 │  ├─ token.test.mjs           # 17 项令牌稳定性断言（原子写 / 损坏不覆盖 / rotate / 并发）
-│  ├─ translator.test.mjs      # 19 项适配层断言（流式能力校验 + tool_calls 保真 + 超时 504 + reasoning_effort 降级重试）
+│  ├─ translator.test.mjs      # 26 项适配层断言（流式能力校验 + tool_calls 保真 + 超时 504 + reasoning_effort 降级重试 + 上下文预算裁剪）
 │  ├─ health.test.mjs          # 8 项上游健康断言（启动检查 / 连续失败判红 / 恢复清零）
 │  ├─ limiter.test.mjs         # 19 项并发/队列断言（FIFO / 队列满 503 / 排队超时 / 槽位生效）
 │  ├─ console.test.mjs         # 56 项控制台断言（鉴权 / 跨站 / 起停 / 真模型 / 无明文 / 过滤契约 / 并发统计 / 最近请求）
@@ -298,6 +298,30 @@ manifest 只描述「是什么、怎么找、怎么连」，**不描述「怎么
 - **客户端断开 → 取消上游**：不仅流式，非流式 `/chat/completions` 和 `/responses` 也会把断连信号传给上游。Coopanion 这类会“抢占上一轮”的客户端，不会再让被取消的请求继续占着 Ollama 的唯一槽位（表现为下一轮等 50–70 秒才开始）。控制台里会记为 499 / `apx_client_aborted`，这是正常抢占，不是故障。实测：长请求发出 500ms 后取消，紧接着的短请求 **881ms** 完成。
 - `/health` 与 `/api/status` 都返回 `concurrency: {active, queued, maxConcurrent, admitted, rejected, timedOut, p95WaitMs…}`，控制台运行横幅显示「并发 x/y · 排队 n」。
 
+## 上下文预算（给本地小模型）
+
+桌面宠物/agent 客户端常常每轮带上全部历史 + 几十个工具。实测 Coopanion 一轮会发 **20 万字符 / 629 条消息 / 71 个工具**，Ollama 光渲染模板就要 40–70 秒，最后还会截到 2050 tokens。
+
+manifest 可以用 `limits` 设预算：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `maxInputChars` | 0（不裁剪） | 系统提示 + 工具 + 最近消息的字符预算 |
+| `maxTools` | 0（不裁剪） | 最多保留多少个工具；最近对话里实际调用过的工具优先保留 |
+| `textToTool` | 无 | 小模型不会调用工具时的兼容层：`{tool, argument, maxChars}`。若请求里提供了该工具、模型只回了纯文本，就把文本包成一次工具调用（例如 Coopanion 的 `pet_say({"script":...})`）。最后一条已经是该工具回执时不再包装，避免死循环 |
+
+`local-openai-service` 默认启用 `4200 / 5`，规则：
+
+1. **系统提示（system/developer）永远保留**；
+2. 从最近的消息往前保留，直到预算用完；最后一条用户消息必留；
+3. 工具优先保留最近消息里调用过的，剩余名额按原顺序补；
+4. 会清理被裁断的孤立 `tool` 消息，避免上游报“tool 消息没有对应的 tool_calls”；
+5. 非流式响应在 `apx.degraded` 里标 `messages_trimmed=N` / `tools_trimmed=N`；流式响应头带 `x-apx-trimmed`。
+
+代价是旧记忆会丢。要完整上下文就把前两个值调大或设为 0；但 Ollama 默认 4096 上下文仍会截断（见“已知限制”第 6 条）。
+
+`local-openai-service` 另外开启了 `textToTool: {tool:"pet_say", argument:"script", maxChars:400}`：Coopanion 的桌宠只有收到 `pet_say` 工具调用才会显示气泡，而 `qwen2.5:0.5b` 实测不会主动调用工具。开启后，纯文本回复会被包成 `pet_say({"script":"..."})`，让气泡能动；模型真正返回 `tool_calls` 时不会覆盖。**这是兼容层，不是模型真的会调工具**。
+
 ## 令牌管理
 
 ```bash
@@ -398,10 +422,10 @@ GET  /api/snippet      {baseURL, apiKey, models[]} 供复制
 
 ```bash
 cd prototype
-node test/smoke.mjs        # 99/99：假上游 + 真代理进程（鉴权/流式/凭证/重放/健康检查/429·503 Retry-After/5xx 保真/Responses/无 /v1 兼容/tool_calls 直通与伪流式/模型详情/logprobs·refusal）
+node test/smoke.mjs        # 107/107：假上游 + 真代理进程（鉴权/流式/凭证/重放/健康检查/429·503 Retry-After/5xx 保真/Responses/无 /v1 兼容/tool_calls 直通与伪流式/模型详情/logprobs·refusal）
 node test/probe.test.mjs   # 23–25/25：L0–L3 分级 + port-scan 命中判据（含两个假阳回归）
 node test/token.test.mjs   # 17/17：令牌不得被意外轮换（原子写/损坏抛错/rotate/8 进程并发）
-node test/translator.test.mjs # 19/19：流式能力校验 / tool_calls 保真 / 非流式与流式首字节超时 504 / 非推理模型去掉 reasoning_effort 重试
+node test/translator.test.mjs # 26/26：流式能力校验 / tool_calls 保真 / 超时 504 / reasoning_effort 重试 / 上下文预算裁剪与工具配对
 node test/health.test.mjs  # 8/8：上游健康（启动检查 / 连续 2 次失败判红 / 恢复后清零）
 node test/limiter.test.mjs # 19/19：并发上限 / FIFO / 队列满快速 503 / 排队超时 / 槽位真的限制在途数
 node test/console.test.mjs # 56/56：控制台（401/403/起停/真模型/无明文/令牌稳定/默认视图一致/空候选可启动/并发统计/最近请求）；无本机上游则 skip
@@ -410,7 +434,7 @@ node test/adapters.test.mjs# 52/52（另 2 项外部依赖 skip）：manifest/�
 node test/e2e-real.mjs     # 17/17：controller 直连本机推理服务（真文本 + 首块 < 3s + Responses + 提供方识别）；无上游则 skip
 ```
 
-一条命令跑全部：`npm run test:all`（等价于上面十条按顺序执行，共 327 项）。
+一条命令跑全部：`npm run test:all`（等价于上面十条按顺序执行，共 342 项）。
 
 每个套件都会把状态目录隔离到自己的临时目录（`APX_STATE_DIR`），跑完自动清理——所以并行验收不会互相踩 `~/.apx/state.json`。要指定目录（例如排查问题时保留现场）：`APX_STATE_DIR=/path/to/dir npm run test:all`。
 

@@ -745,6 +745,7 @@
     if (a.serviceFace.strategy === 'remote') parts.push('远端：' + (a.serviceFace.baseUrl || '-'));
     parts.push('上游代理：' + (a.proxyEnv ? a.proxyEnv.label : '-'));
     parts.push('凭据来源：' + (a.authKind || 'none'));
+    if (a.limits && a.limits.maxInputChars) parts.push('上下文预算：' + a.limits.maxInputChars + ' 字符 / ' + (a.limits.maxTools ?? '不限') + ' 个工具');
     if (a.experimental) parts.push('★ 实验性：可能不可用，先看 quirks');
     if (a.hits && a.hits.length) parts.push('匹配：' + a.hits.map((h) => h.name + (h.running ? '(运行中)' : '')).join('，'));
     $('#adapter-meta').textContent = parts.join('　·　');

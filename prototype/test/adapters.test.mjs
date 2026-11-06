@@ -265,7 +265,7 @@ async function main() {
     );
     fs.writeFileSync(
       path.join(tmp, 'bad.json'),
-      JSON.stringify({ ...base, id: 'limits-bad', limits: { maxConcurrent: 0, maxQueue: -1, requestTimeoutMs: 'soon' } }),
+      JSON.stringify({ ...base, id: 'limits-bad', limits: { maxConcurrent: 0, maxQueue: -1, requestTimeoutMs: 'soon', maxInputChars: -1, maxTools: -2 } }),
     );
     const loaded = loadAdapters({ extraDirs: [tmp] });
     check('合法 limits 正常加载', loaded.adapters.some((a) => a.id === 'limits-good' && a.limits.maxConcurrent === 4), loaded.adapters.map((a) => a.id).join(','));

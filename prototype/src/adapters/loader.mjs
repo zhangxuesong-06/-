@@ -71,10 +71,20 @@ function validate(m, file) {
         ['requestTimeoutMs', 1],
         ['streamFirstByteTimeoutMs', 1],
         ['streamIdleTimeoutMs', 1],
+        ['maxInputChars', 0],
+        ['maxTools', 0],
       ]) {
         if (m.limits[key] === undefined) continue;
         if (!Number.isInteger(m.limits[key]) || m.limits[key] < min) {
           errors.push({ field: `limits.${key}`, expected: `integer >= ${min}`, actual: String(m.limits[key]) });
+        }
+      }
+      const t2t = m.limits.textToTool;
+      if (t2t !== undefined) {
+        if (!t2t || typeof t2t !== 'object' || Array.isArray(t2t) || typeof t2t.tool !== 'string' || !t2t.tool) {
+          errors.push({ field: 'limits.textToTool', expected: '{tool:string, argument:string, maxChars?:integer}', actual: JSON.stringify(t2t) });
+        } else if (t2t.maxChars !== undefined && (!Number.isInteger(t2t.maxChars) || t2t.maxChars <= 0)) {
+          errors.push({ field: 'limits.textToTool.maxChars', expected: 'positive integer', actual: String(t2t.maxChars) });
         }
       }
     }

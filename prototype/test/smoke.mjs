@@ -204,6 +204,7 @@ async function main() {
           requestHooks: [],
         },
         capabilities: { streaming: true, tools: true },
+        limits: { textToTool: { tool: 'pet_say', argument: 'script', maxChars: 400 } },
         sessionPolicy: 'stateless',
       },
       null,
@@ -308,6 +309,40 @@ async function main() {
     check('usage 透传', Boolean(j.usage?.total_tokens), JSON.stringify(j.usage));
     check('choices[0].logprobs 存在且为 null（官方 schema 必填可空）', j.choices?.[0]?.logprobs === null, JSON.stringify(j.choices?.[0]));
     check('message.refusal 存在且为 null', j.choices?.[0]?.message?.refusal === null, JSON.stringify(j.choices?.[0]?.message));
+  }
+
+  console.log('[3a] 小模型纯文本 → pet_say 兼容层（Coopanion 桌宠）');
+  const petTool = { type: 'function', function: { name: 'pet_say', parameters: { type: 'object', properties: { script: { type: 'string' } } } } };
+  {
+    const r = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ model: 'fake-1', messages: [{ role: 'user', content: 'hello pet' }], tools: [petTool] }),
+    });
+    const j = await r.json().catch(() => null);
+    const call = j?.choices?.[0]?.message?.tool_calls?.[0];
+    check('纯文本被包装成 pet_say 调用', call?.function?.name === 'pet_say', JSON.stringify(j?.choices?.[0]?.message));
+    check('文本进入 script 参数', JSON.parse(call?.function?.arguments || '{}').script === 'echo:hello pet', call?.function?.arguments);
+    check('finish_reason=tool_calls', j?.choices?.[0]?.finish_reason === 'tool_calls', String(j?.choices?.[0]?.finish_reason));
+    check('不再同时返回 content', j?.choices?.[0]?.message?.content === null, JSON.stringify(j?.choices?.[0]?.message?.content));
+  }
+  {
+    // 最后一条已经是 pet_say 的回执 → 不再包装，避免工具调用死循环
+    const r = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({
+        model: 'fake-1',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'pet_say', arguments: '{"script":"hi"}' } }] },
+          { role: 'tool', tool_call_id: 'c1', content: 'shown' },
+        ],
+        tools: [petTool],
+      }),
+    });
+    const j = await r.json().catch(() => null);
+    check('工具回执后不再重复包装', !j?.choices?.[0]?.message?.tool_calls && j?.choices?.[0]?.message?.content === 'echo:shown', JSON.stringify(j?.choices?.[0]?.message));
   }
 
   console.log('[3b] 工具调用：非流式直通不能丢 tool_calls');
@@ -612,6 +647,23 @@ async function main() {
     check('无 [DONE]（Responses 用事件收尾，不用 Chat 的 [DONE]）', !text.includes('data: [DONE]'));
   }
   console.log('[11b] Responses API 工具调用：tools / function_call / function_call_output');
+  {
+    // Coopanion 的桌宠走 Responses；纯文本也要能变成 pet_say 工具调用
+    const r = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({
+        model: 'fake-1',
+        input: 'hello pet',
+        tools: [{ type: 'function', name: 'pet_say', parameters: { type: 'object', properties: { script: { type: 'string' } } } }],
+      }),
+    });
+    const j = await r.json().catch(() => null);
+    const fc = j?.output?.find((x) => x.type === 'function_call');
+    check('Responses 纯文本被包装成 pet_say', fc?.name === 'pet_say', JSON.stringify(j?.output));
+    check('Responses script 参数正确', JSON.parse(fc?.arguments || '{}').script === 'echo:hello pet', fc?.arguments);
+    check('Responses 纯工具调用 output_text 为空', j?.output_text === '', JSON.stringify(j?.output_text));
+  }
   const toolDef = {
     type: 'function',
     name: 'get_weather',

@@ -62,6 +62,115 @@ function estimateTokens(text) {
   return Math.max(1, Math.round(String(text || '').length / 2.2));
 }
 
+/** 粗略的 JSON 字符数，用来做输入预算；不追求 token 精度。 */
+function jsonChars(v) {
+  try {
+    return JSON.stringify(v ?? null).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 本地小模型的上下文预算。
+ *
+ * 为什么需要：Coopanion 这类客户端每轮会带全部历史 + 几十个工具（实测 20 万字符 /
+ * 629 条消息 / 71 个工具）。Ollama 光渲染这个模板就要 40–70 秒，而且最后还会
+ * 截到 2050 tokens——既慢又可能丢人设。这里在发上游前保留：系统提示 + 最近消息 +
+ * 限量工具，并如实标注降级。
+ *
+ * 只在 manifest 显式声明 limits.maxInputChars 时启用；普通客户端不受影响。
+ */
+function trimPassthroughBody(body, limits = {}) {
+  const maxChars = Number(limits.maxInputChars) || 0;
+  if (!maxChars) return { body, degraded: [] };
+  const maxTools = Number.isInteger(limits.maxTools) && limits.maxTools >= 0 ? limits.maxTools : null;
+  const degraded = [];
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  let tools = Array.isArray(body.tools) ? body.tools : [];
+
+  const isSystem = (m) => m?.role === 'system' || m?.role === 'developer';
+  const system = messages.filter(isSystem);
+  const rest = messages.filter((m) => !isSystem(m));
+
+  // 预算先按“最多保留 maxTools 个工具”估算；真正裁剪放在消息筛选之后，
+  // 以便优先保留最近消息里实际用到的工具。
+  const projectedTools = maxTools !== null ? tools.slice(0, maxTools) : tools;
+  let used = jsonChars(system) + jsonChars(projectedTools);
+  if (used > maxChars && tools.length) {
+    // 系统提示 + 工具本身就超预算：先牺牲工具，别把系统提示/最近对话挤没。
+    degraded.push('tools_omitted');
+    tools = [];
+    used = jsonChars(system);
+  }
+
+  const kept = [];
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const m = rest[i];
+    const size = jsonChars(m);
+    if (kept.length === 0) {
+      kept.push(m); // 最后一条必留：通常是用户这次真正说的话
+      used += size;
+      continue;
+    }
+    if (used + size > maxChars) break;
+    kept.push(m);
+    used += size;
+  }
+  kept.reverse();
+  const dropped = rest.length - kept.length;
+  if (dropped > 0) degraded.push(`messages_trimmed=${dropped}`);
+
+  // 防止把 assistant.tool_calls 和对应的 tool 结果拆散：孤立的 tool 消息会被上游拒绝。
+  const callIds = new Set();
+  for (const m of kept) {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const c of m.tool_calls) if (c?.id) callIds.add(c.id);
+    }
+  }
+  const outputIds = new Set();
+  const filtered = kept.filter((m) => {
+    if (m?.role === 'tool' && m.tool_call_id) {
+      if (!callIds.has(m.tool_call_id)) return false;
+      outputIds.add(m.tool_call_id);
+    }
+    return true;
+  });
+  const cleaned = filtered.filter((m) => {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const hasOutput = m.tool_calls.some((c) => outputIds.has(c.id));
+      const hasText = typeof m.content === 'string' && m.content.trim();
+      if (!hasOutput && !hasText) return false;
+    }
+    return true;
+  });
+  if (cleaned.length !== kept.length) degraded.push(`tool_groups_dropped=${kept.length - cleaned.length}`);
+
+  if (maxTools !== null && tools.length > maxTools) {
+    const usedNames = new Set();
+    for (const m of cleaned) {
+      if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) if (c?.function?.name) usedNames.add(c.function.name);
+      }
+    }
+    // 最近对话真正调用过的工具优先保留，剩余名额按原顺序补。
+    const referenced = tools.filter((t) => usedNames.has(t?.function?.name));
+    const others = tools.filter((t) => !usedNames.has(t?.function?.name));
+    const nextTools = [...referenced, ...others].slice(0, maxTools);
+    degraded.push(`tools_trimmed=${tools.length - nextTools.length}`);
+    tools = nextTools;
+  }
+
+  const next = { ...body, messages: [...system, ...cleaned] };
+  if (!tools.length) {
+    delete next.tools;
+    delete next.tool_choice;
+  } else {
+    next.tools = tools;
+  }
+  return { body: next, degraded };
+}
+
 /**
  * 解析 Retry-After 响应头（RFC 7231 允许两种形式：纯秒数 / HTTP-date）。
  * 统一折算成毫秒；解析不了返回 null（不猜）。
@@ -261,7 +370,8 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
 
     // 直通型：上游本身就是 OpenAI 形状，原样转发（保留 tools/temperature 等全部参数）
     if (face.type === 'openai-passthrough') {
-      const passthroughBody = { ...body, model: resolved.upstreamId, stream: false };
+      const trimmed = trimPassthroughBody({ ...body, model: resolved.upstreamId, stream: false }, limits);
+      const passthroughBody = trimmed.body;
       applyHooks(passthroughBody, hooks);
       let r = await request(spec.path || '/v1/chat/completions', { method: 'POST', body: passthroughBody, signal });
       let strippedReasoning = false;
@@ -298,7 +408,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
         finishReason: choice?.finish_reason || (toolCalls.length ? 'tool_calls' : legacyCall ? 'function_call' : 'stop'),
         usage: r.json.usage,
         usageEstimated: false,
-        apxDegraded: strippedReasoning ? ['reasoning_effort'] : [],
+        apxDegraded: [...trimmed.degraded, ...(strippedReasoning ? ['reasoning_effort'] : [])],
       };
     }
 
@@ -364,8 +474,11 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
     }
     const spec = upstream.generate || {};
     let payload;
+    let trimmedDegraded = [];
     if (face.type === 'openai-passthrough') {
-      payload = { ...body, model: resolved.upstreamId, stream: true };
+      const trimmed = trimPassthroughBody({ ...body, model: resolved.upstreamId, stream: true }, limits);
+      payload = trimmed.body;
+      trimmedDegraded = trimmed.degraded;
     } else {
       payload = spec.body ? buildBody(spec.body, { prompt: flattenMessages(body.messages), model: resolved }) : { prompt: flattenMessages(body.messages) };
       payload.stream = true;
@@ -453,6 +566,7 @@ export function createTranslator({ adapter, ctx, onEvent = () => {} }) {
       touch,
       pause,
       resume,
+      degraded: trimmedDegraded,
       timedOut: () => abortReason,
     };
   }

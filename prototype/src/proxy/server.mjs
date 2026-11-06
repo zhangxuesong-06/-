@@ -60,6 +60,70 @@ function readBody(req, limit = 4 * 1024 * 1024) {
  * 直通型上游可能带 tool_calls / reasoning_content / refusal，必须原样交给下游；
  * 声明式映射型只有 text，就按标准 message 组装。
  */
+/**
+ * 本地小模型不会调用工具时的兼容层（manifest 显式开启）。
+ *
+ * Coopanion 的桌宠只有在 bot 调用 `pet_say({script})` 时才会显示气泡；
+ * qwen2.5:0.5b 这类模型只会回纯文本。开启 textToTool 后，如果请求里确实提供了
+ * 这个工具，且模型没有返回 tool_calls，就把文本包成一次工具调用。
+ *
+ * 防循环：如果最后一条消息已经是该工具的返回结果，就不再包装——说明这一轮
+ * 只是模型在消化工具回执。
+ */
+function lastToolResultName(body) {
+  if (Array.isArray(body?.messages)) {
+    const last = body.messages.at(-1);
+    if (last?.role !== 'tool') return null;
+    for (let i = body.messages.length - 2; i >= 0; i--) {
+      const m = body.messages[i];
+      if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        const hit = m.tool_calls.find((c) => c.id === last.tool_call_id);
+        if (hit) return hit.function?.name || null;
+      }
+    }
+    return null;
+  }
+  if (Array.isArray(body?.input)) {
+    const last = body.input.at(-1);
+    if (last?.type !== 'function_call_output') return null;
+    for (let i = body.input.length - 2; i >= 0; i--) {
+      const it = body.input[i];
+      if (it?.type === 'function_call' && (it.call_id || it.id) === last.call_id) return it.name || null;
+    }
+    return null;
+  }
+  return null;
+}
+
+function maybeSynthesizeTextToolCall(adapter, body, result) {
+  const cfg = adapter.limits?.textToTool;
+  if (!cfg?.tool) return result;
+  if (result.message?.tool_calls?.length || result.message?.function_call) return result;
+  const text = String(result.text || '').trim();
+  if (!text) return result;
+
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const offered = tools.some((t) => (t?.function?.name || t?.name) === cfg.tool);
+  if (!offered) return result;
+  if (lastToolResultName(body) === cfg.tool) return result;
+
+  const max = Number.isInteger(cfg.maxChars) && cfg.maxChars > 0 ? cfg.maxChars : 400;
+  const script = text.length > max ? text.slice(0, max) + '…' : text;
+  const args = { [cfg.argument || 'script']: script };
+  const call = {
+    id: `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+    type: 'function',
+    function: { name: cfg.tool, arguments: JSON.stringify(args) },
+  };
+  return {
+    ...result,
+    text: '',
+    message: { role: 'assistant', content: null, tool_calls: [call] },
+    finishReason: 'tool_calls',
+    apxDegraded: [...(result.apxDegraded || []), `text_to_tool:${cfg.tool}`],
+  };
+}
+
 function assistantMessage(result) {
   const message =
     result.message && typeof result.message === 'object'
@@ -82,7 +146,7 @@ function chunkFrame({ id, created, model, delta, finish = null }) {
 }
 
 /** 伪流式：上游只能一次性返回时，按自然吐字节奏回放，并在响应头标注降级。 */
-async function pseudoStream(res, { text, message, finishReason = 'stop', model, chunkSize = 24, delayMs = 30 }) {
+async function pseudoStream(res, { text, message, finishReason = 'stop', model, degraded = [], chunkSize = 24, delayMs = 30 }) {
   const id = newCompletionId();
   const created = Math.floor(Date.now() / 1000);
   const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
@@ -91,6 +155,7 @@ async function pseudoStream(res, { text, message, finishReason = 'stop', model, 
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
     'x-apx-degraded': 'pseudo-stream',
+    ...(degraded.length ? { 'x-apx-trimmed': degraded.join(',') } : {}),
   });
   res.write(chunkFrame({ id, created, model, delta: { role: 'assistant', content: '' } }));
   let closed = false;
@@ -147,12 +212,13 @@ function waitForDrain(res) {
  * 真流式透传：二进制安全、逐块写出、不缓冲。
  * 客户端断开 → 立刻取消上游读取（不然上游继续生成，继续烧额度）。
  */
-async function pipeUpstreamStream(res, { stream, abort, touch, pause, resume, timedOut, stats }) {
+async function pipeUpstreamStream(res, { stream, abort, touch, pause, resume, timedOut, degraded = [], stats }) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
     'x-apx-stream': 'passthrough',
+    ...(degraded.length ? { 'x-apx-trimmed': degraded.join(',') } : {}),
   });
   const reader = stream.getReader();
   let closed = false;
@@ -396,6 +462,7 @@ function buildResponsesPayload({
   tools = [],
   toolChoice = 'auto',
   parallelToolCalls = true,
+  degraded = [],
   // 流式回放时传入同一份 items，保证 response.completed 里的 item id
   // 与前面 output_item.added / done 事件完全一致（客户端靠 id 配对）。
   outputItems = null,
@@ -421,7 +488,7 @@ function buildResponsesPayload({
     tools,
     top_p: topP,
     usage: responsesUsage(usage),
-    apx: { adapter: adapterId, usage_estimated: Boolean(estimated) },
+    apx: { adapter: adapterId, usage_estimated: Boolean(estimated), degraded },
   };
 }
 
@@ -442,6 +509,7 @@ async function responsesPseudoStream(res, {
   tools = [],
   toolChoice = 'auto',
   parallelToolCalls = true,
+  degraded = [],
   chunkSize = 24,
   delayMs = 30,
 }) {
@@ -452,6 +520,7 @@ async function responsesPseudoStream(res, {
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
     'x-apx-degraded': 'pseudo-stream',
+    ...(degraded.length ? { 'x-apx-trimmed': degraded.join(',') } : {}),
   });
   let seq = 0;
   const emit = (event) => {
@@ -524,6 +593,7 @@ async function responsesPseudoStream(res, {
       tools,
       toolChoice,
       parallelToolCalls,
+      degraded,
       outputItems: items,
     }),
   });
@@ -723,18 +793,28 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
           }
           if (s.stream) {
             done(200);
-            return await pipeUpstreamStream(res, { stream: s.stream, abort: s.abort, touch: s.touch, pause: s.pause, resume: s.resume, timedOut: s.timedOut, stats });
+            return await pipeUpstreamStream(res, {
+              stream: s.stream,
+              abort: s.abort,
+              touch: s.touch,
+              pause: s.pause,
+              resume: s.resume,
+              timedOut: s.timedOut,
+              degraded: s.degraded || [],
+              stats,
+            });
           }
           // 上游不支持真流式 → 先取完整结果，再伪流式回放
         }
 
-        const result = await translator.chat(body, { signal: clientAbort.signal });
+        let result = await translator.chat(body, { signal: clientAbort.signal });
         if (result.error) {
           req.apx.code = result.error.code || null;
           done(result.error.status);
           if (result.error.clientAborted) return;
           return sendError(res, result.error.status, result.error);
         }
+        result = maybeSynthesizeTextToolCall(adapter, body, result);
 
         if (body.stream) {
           done(200);
@@ -749,6 +829,7 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
             message: result.message,
             finishReason: result.finishReason || 'stop',
             model: body.model,
+            degraded: result.apxDegraded || [],
           });
         }
 
@@ -846,13 +927,14 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
           chatBody.reasoning_effort = body.reasoning.effort;
         }
 
-        const result = await translator.chat(chatBody, { signal: clientAbort.signal });
+        let result = await translator.chat(chatBody, { signal: clientAbort.signal });
         if (result.error) {
           req.apx.code = result.error.code || null;
           done(result.error.status);
           if (result.error.clientAborted) return;
           return sendError(res, result.error.status, result.error);
         }
+        result = maybeSynthesizeTextToolCall(adapter, body, result);
 
         const id = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
         const created = Math.floor(Date.now() / 1000);
@@ -871,6 +953,7 @@ export function createProxyServer({ host = '127.0.0.1', token, translator, adapt
           tools: responseTools,
           toolChoice: responseToolChoice,
           parallelToolCalls,
+          degraded: result.apxDegraded || [],
         };
 
         if (body.stream) {

@@ -90,6 +90,7 @@ function summarizeAdapter(adapter, candidates) {
     level: adapter.level || '',
     origin: adapter.origin || '',
     capabilities: adapter.capabilities || {},
+    limits: adapter.limits || {},
     quirks: adapter.quirks || {},
     serviceFace: {
       type: adapter.serviceFace?.type || '',
