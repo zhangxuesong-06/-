@@ -28,9 +28,9 @@ func testRegistry(providers ...config.Provider) config.Registry {
 func provider(id, base string) config.Provider {
 	return config.Provider{
 		ID: id, Name: id, Protocol: config.ProtocolOpenAIChat, BaseURL: base,
-		Auth:    config.AuthConfig{Type: "bearer", Env: "APX_TEST_KEY"},
-		Paths:   map[string]string{"chat": "/chat/completions", "models": "/models"},
-		Models:  []config.Model{{ID: "up-model"}},
+		Auth:     config.AuthConfig{Type: "bearer", Env: "APX_TEST_KEY"},
+		Paths:    map[string]string{"chat": "/chat/completions", "models": "/models"},
+		Models:   []config.Model{{ID: "up-model"}},
 		Discover: false,
 	}
 }
@@ -123,7 +123,7 @@ func TestFailoverToSecondProvider(t *testing.T) {
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
 			"choices": []any{map[string]any{
-				"message": map[string]any{"role": "assistant", "content": "from-good"},
+				"message":       map[string]any{"role": "assistant", "content": "from-good"},
 				"finish_reason": "stop",
 			}},
 			"usage": map[string]any{"total_tokens": 4},
@@ -172,7 +172,7 @@ func TestResponsesFromChatUpstream(t *testing.T) {
 		}
 		writeJSON(w, 200, map[string]any{
 			"choices": []any{map[string]any{
-				"message": map[string]any{"role": "assistant", "content": "打个招呼"},
+				"message":       map[string]any{"role": "assistant", "content": "打个招呼"},
 				"finish_reason": "stop",
 			}},
 			"usage": map[string]any{"prompt_tokens": 2, "completion_tokens": 4, "total_tokens": 6},

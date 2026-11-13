@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -23,6 +25,7 @@ import (
 )
 
 func main() {
+	initConsole()
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "apx:", err)
 		os.Exit(1)
@@ -38,6 +41,8 @@ func run(args []string) error {
 	switch cmd {
 	case "serve":
 		return serve(args)
+	case "app":
+		return appCmd(args)
 	case "init":
 		return initRegistry(args)
 	case "scan":
@@ -67,12 +72,16 @@ func usage() {
 
 用法:
   apx                      启动网关（默认 127.0.0.1:8787）
-  apx serve [--listen ADDR]
+  apx serve [--listen ADDR] [--open]
+                            --open 启动后自动打开控制台（已运行则直接打开）
+  apx app [--listen ADDR] [--window-size W,H]
+                            独立窗口模式（无地址栏，关闭窗口即停止网关）
   apx init [--force]       扫描本机 harness 并生成 ~/.apx2/providers.json
   apx scan                 只扫描，不写配置
   apx providers            列出 provider
   apx models               列出可用模型地址
   apx auth set <id> --key K 写入 apx 自己的凭据文件（不动宿主的凭据）
+  apx auth login workbuddy  浏览器登录 WorkBuddy（照 magpie 验证过的流程）
   apx auth list            列出已保存的凭据（只显示尾部）
   apx token                显示本地 API key
   apx doctor               自检配置/凭据/模型解析
@@ -85,44 +94,37 @@ func usage() {
 }
 
 func serve(args []string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	listen := cfg.Listen
+	open := false
+	listen := ""
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--listen" && i+1 < len(args) {
-			listen = args[i+1]
-			i++
+		switch args[i] {
+		case "--listen":
+			if i+1 < len(args) {
+				listen = args[i+1]
+				i++
+			}
+		case "--open":
+			open = true
 		}
 	}
-	cfg.Listen = listen
-	if err := cfg.Save(); err != nil {
-		return err
+	if listen == "" {
+		if cfg, err := config.Load(); err == nil {
+			listen = cfg.Listen
+		}
+	}
+	console := consoleURL(listen)
+	if open && healthy(console) {
+		fmt.Println("apx2 已在运行：", console)
+		openURL(console)
+		return nil
 	}
 
-	reg, err := config.LoadRegistry()
+	st, err := buildStack(listen)
 	if err != nil {
 		return err
 	}
-	if len(reg.Providers) == 0 {
-		fmt.Println("→ 还没有 provider，先扫描本机并生成配置…")
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		rep := harness.Scan(ctx)
-		cancel()
-		reg = harness.Seed(rep)
-		if err := reg.Save(); err != nil {
-			return err
-		}
-	}
-
-	rt := router.New(reg, cfg.Aliases)
-	srv := gateway.New(cfg, rt)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	notes := srv.RefreshModels(ctx)
-	cancel()
-	for _, n := range notes {
+	cfg, srv, rt := st.cfg, st.srv, st.rt
+	for _, n := range st.notes {
 		fmt.Println("  ·", n)
 	}
 
@@ -132,12 +134,16 @@ func serve(args []string) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	reg = rt.Registry()
+	reg := rt.Registry()
 	fmt.Printf("\napx2 %s\n", gateway.Version)
 	fmt.Printf("  端点   http://%s/v1\n", cfg.Listen)
 	fmt.Printf("  Key    %s\n", cfg.Token)
 	fmt.Printf("  控制台 http://%s/\n", cfg.Listen)
 	fmt.Printf("  Provider: %d  模型: %d\n\n", len(reg.Providers), len(reg.ModelIDs()))
+
+	if open {
+		go waitAndOpen(console)
+	}
 
 	stop, stopCancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopCancel()
@@ -145,6 +151,11 @@ func serve(args []string) error {
 	go func() { errCh <- httpSrv.ListenAndServe() }()
 	select {
 	case err := <-errCh:
+		if open && healthy(console) {
+			// Another instance already owns the port; just show its console.
+			openURL(console)
+			return nil
+		}
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -155,6 +166,50 @@ func serve(args []string) error {
 		defer cancel()
 		return httpSrv.Shutdown(ctx)
 	}
+}
+
+type stack struct {
+	cfg   config.Config
+	rt    *router.Router
+	srv   *gateway.Server
+	notes []string
+}
+
+// buildStack loads config/registry, seeds an empty registry from scan, refreshes
+// model lists and returns everything needed to run the HTTP server.
+func buildStack(listen string) (*stack, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	if listen != "" {
+		cfg.Listen = listen
+	}
+	if err := cfg.Save(); err != nil {
+		return nil, err
+	}
+
+	reg, err := config.LoadRegistry()
+	if err != nil {
+		return nil, err
+	}
+	if len(reg.Providers) == 0 {
+		fmt.Println("→ 还没有 provider，先扫描本机并生成配置…")
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		rep := harness.Scan(ctx)
+		cancel()
+		reg = harness.Seed(rep)
+		if err := reg.Save(); err != nil {
+			return nil, err
+		}
+	}
+
+	rt := router.New(reg, cfg.Aliases)
+	srv := gateway.New(cfg, rt)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	notes := srv.RefreshModels(ctx)
+	cancel()
+	return &stack{cfg: cfg, rt: rt, srv: srv, notes: notes}, nil
 }
 
 func initRegistry(args []string) error {
@@ -239,6 +294,9 @@ func providersCmd() error {
 			authKind = "none"
 		}
 		fmt.Printf("%-12s %-18s %-28s auth=%-16s models=%d\n", p.ID, p.Protocol, p.BaseURL, authKind, len(p.Models))
+		if p.Proxy != "" {
+			fmt.Printf("  proxy: %s\n", p.Proxy)
+		}
 		if p.Notes != "" {
 			fmt.Printf("  %s\n", p.Notes)
 		}
@@ -304,6 +362,45 @@ func authCmd(args []string) error {
 		}
 		fmt.Println(string(raw))
 		return nil
+	case "login":
+		if len(args) < 2 || args[1] != "workbuddy" {
+			return fmt.Errorf("用法: apx auth login workbuddy")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		login, err := auth.StartWorkBuddyLogin(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Println("请在浏览器完成 WorkBuddy 登录：")
+		fmt.Println(login.URL)
+		auth.OpenWorkBuddyLogin(login.URL)
+		tok, err := auth.PollWorkBuddyLogin(ctx, login)
+		if err != nil {
+			return err
+		}
+		path, err := auth.WorkBuddyTokenPath("")
+		if err != nil {
+			return err
+		}
+		if err := auth.SaveWorkBuddyToken(path, tok); err != nil {
+			return err
+		}
+		reg, _ := config.LoadRegistry()
+		for i := range reg.Providers {
+			if reg.Providers[i].ID != "workbuddy" {
+				continue
+			}
+			reg.Providers[i].Auth.Type = "workbuddy-oauth"
+			reg.Providers[i].Auth.File = "~/.apx2/auth/workbuddy.json"
+			reg.Providers[i].Auth.Env = ""
+			reg.Providers[i].Discover = true
+			_ = reg.Save()
+			break
+		}
+		fmt.Println("登录成功：", firstNonEmpty(tok.AccountName, tok.UID))
+		fmt.Println("token:", path)
+		return nil
 	}
 	return fmt.Errorf("未知 auth 子命令 %q", args[0])
 }
@@ -321,6 +418,7 @@ func doctorCmd() error {
 	fmt.Println("registry", config.RegistryPath())
 	fmt.Println("creds   ", config.CredentialsPath())
 	fmt.Println("listen  ", cfg.Listen)
+	fmt.Println("proxy   ", firstNonEmpty(cfg.Proxy, "（使用 provider 自己的 proxy 或环境变量）"))
 	fmt.Println("token   ", config.MaskToken(cfg.Token))
 	fmt.Println("providers", len(reg.Providers), "models", len(reg.ModelIDs()))
 	for _, p := range reg.Providers {
@@ -346,6 +444,46 @@ func doctorCmd() error {
 }
 
 func authFor(p config.Provider) auth.Resolver { return auth.Build(p) }
+
+func consoleURL(listen string) string {
+	return "http://" + listen + "/"
+}
+
+func healthy(base string) bool {
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	resp, err := client.Get(strings.TrimRight(base, "/") + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func waitAndOpen(base string) {
+	for i := 0; i < 40; i++ {
+		if healthy(base) {
+			openURL(base)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func openURL(u string) {
+	if os.Getenv("APX_NO_BROWSER") != "" {
+		return
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", u)
+	case "darwin":
+		cmd = exec.Command("open", u)
+	default:
+		cmd = exec.Command("xdg-open", u)
+	}
+	_ = cmd.Start()
+}
 
 func tail(s string, n int) string {
 	if len(s) <= n {

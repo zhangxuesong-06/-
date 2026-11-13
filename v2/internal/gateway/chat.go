@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,7 @@ func authFor(p config.Provider) auth.Resolver { return auth.Build(p) }
 type call struct {
 	downstream string // chat | responses
 	model      string
+	client     string
 	stream     bool
 	buffered   bool
 	res        router.Resolution
@@ -76,6 +78,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	c := &call{
 		downstream:   "chat",
 		model:        displayModel(requested, res),
+		client:       clientName(r),
 		stream:       boolValue(body["stream"]),
 		res:          res,
 		original:     body,
@@ -130,6 +133,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	c := &call{
 		downstream:   "responses",
 		model:        displayModel(requested, res),
+		client:       clientName(r),
 		stream:       boolValue(body["stream"]),
 		res:          res,
 		original:     body,
@@ -181,24 +185,29 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 
 	var lastStatus = http.StatusBadGateway
 	var lastErr = map[string]any{"message": "所有上游都不可用", "type": "apx_upstream_error", "code": "apx_all_failed"}
-	var lastProvider string
+	var lastProvider, lastAccount, lastAccountID string
 	var notes []string
 
 	for i, t := range targets {
 		kind, body := buildUpstream(c, t)
+		acct := auth.DescribeAccount(t.Provider, t.Account)
+		account := acct.Label
+		lastAccount = account
+		lastAccountID = t.AccountID()
 		timeout := time.Duration(s.cfg.TimeoutSeconds) * time.Second
 		if t.Provider.TimeoutSeconds > 0 {
 			timeout = time.Duration(t.Provider.TimeoutSeconds) * time.Second
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		resp, err := s.up.Do(ctx, upstream.Request{
-			Provider: t.Provider, Kind: kind, Body: body, Auth: authFor(t.Provider),
+			Provider: t.Provider, Kind: kind, Body: body, Auth: auth.BuildAccount(t.Provider, t.Account),
+			Headers: extraHeaders(t, c),
 		})
 		elapsed := time.Since(start)
 		if err != nil {
 			cancel()
 			msg := err.Error()
-			s.rt.Record(t.Provider.ID, false, elapsed, msg, 0)
+			s.rt.RecordTarget(t, false, elapsed, msg, 0)
 			notes = append(notes, fmt.Sprintf("%s: %s", t.Provider.ID, msg))
 			lastProvider, lastStatus = t.Provider.ID, http.StatusBadGateway
 			lastErr = map[string]any{"message": msg, "type": "apx_upstream_unreachable", "code": "apx_upstream_unreachable"}
@@ -209,7 +218,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 			status, errBody := upstream.ErrorBody(resp)
 			cancel()
 			msg := errorMessage(errBody, status)
-			s.rt.Record(t.Provider.ID, false, elapsed, msg, 0)
+			s.rt.RecordTarget(t, false, elapsed, msg, 0)
 			notes = append(notes, fmt.Sprintf("%s: %s", t.Provider.ID, msg))
 			lastProvider = t.Provider.ID
 			if retryable(status) && i < len(targets)-1 {
@@ -218,8 +227,8 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 				continue
 			}
 			s.record(RequestRecord{
-				At: time.Now().Format(time.RFC3339), Path: r.URL.Path, Model: c.model,
-				Provider: t.Provider.ID, Group: c.res.Group, Stream: c.stream,
+				At: time.Now().Format(time.RFC3339), Path: r.URL.Path, Client: c.client, Model: c.model,
+				Provider: t.Provider.ID, Account: account, AccountID: t.AccountID(), Group: c.res.Group, Stream: c.stream,
 				Status: status, MS: time.Since(start).Milliseconds(),
 				InputChars: c.inputChars(), Code: fmt.Sprintf("upstream_%d", status), Error: msg,
 			})
@@ -228,16 +237,20 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 		}
 
 		w.Header().Set("X-Apx-Provider", t.Provider.ID)
+		w.Header().Set("X-Apx-Account", account)
+		if t.AccountID() != "" {
+			w.Header().Set("X-Apx-Account-Id", t.AccountID())
+		}
 		if c.res.Group != "" {
 			w.Header().Set("X-Apx-Group", c.res.Group)
 		}
 		tokens, code := s.render(w, r, c, t, resp)
 		cancel()
 		_ = code
-		s.rt.Record(t.Provider.ID, true, elapsed, "", tokens)
+		s.rt.RecordTarget(t, true, elapsed, "", tokens)
 		rec := RequestRecord{
-			At: time.Now().Format(time.RFC3339), Path: r.URL.Path, Model: c.model,
-			Provider: t.Provider.ID, Group: c.res.Group, Stream: c.stream,
+			At: time.Now().Format(time.RFC3339), Path: r.URL.Path, Client: c.client, Model: c.model,
+			Provider: t.Provider.ID, Account: account, AccountID: t.AccountID(), Group: c.res.Group, Stream: c.stream,
 			Status: http.StatusOK, MS: time.Since(start).Milliseconds(),
 			InputChars: c.inputChars(), Tokens: tokens,
 		}
@@ -252,8 +265,8 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 	}
 
 	s.record(RequestRecord{
-		At: time.Now().Format(time.RFC3339), Path: r.URL.Path, Model: c.model,
-		Provider: lastProvider, Group: c.res.Group, Stream: c.stream,
+		At: time.Now().Format(time.RFC3339), Path: r.URL.Path, Client: c.client, Model: c.model,
+		Provider: lastProvider, Account: lastAccount, AccountID: lastAccountID, Group: c.res.Group, Stream: c.stream,
 		Status: lastStatus, MS: time.Since(start).Milliseconds(),
 		InputChars: c.inputChars(), Code: "apx_all_failed", Error: strings.Join(notes, "; "),
 	})
@@ -261,34 +274,113 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 }
 
 func buildUpstream(c *call, t router.Target) (string, map[string]any) {
-	switch t.Provider.Protocol {
+	codex := isCodex(t.Provider)
+	switch t.Protocol() {
 	case config.ProtocolAnthropic:
 		body := protocol.ChatToAnthropic(c.chatBody)
 		body["model"] = t.Model
-		body["stream"] = c.streamFor(config.ProtocolAnthropic)
+		body["stream"] = c.streamFor(config.ProtocolAnthropic) || isWorkBuddy(t.Provider)
 		return "messages", body
 	case config.ProtocolOpenAIResponses:
 		body := protocol.ChatToResponsesRequest(c.chatBody)
 		body["model"] = t.Model
 		body["stream"] = c.streamFor(config.ProtocolOpenAIResponses)
+		if codex {
+			// The Codex backend only speaks streaming and expects a few
+			// Responses defaults. We buffer downstream when it asked for JSON.
+			body["stream"] = true
+			if _, ok := body["store"]; !ok {
+				body["store"] = false
+			}
+			if _, ok := body["include"]; !ok {
+				body["include"] = []any{"reasoning.encrypted_content"}
+			}
+			if _, ok := body["reasoning"]; !ok {
+				body["reasoning"] = map[string]any{"effort": "low"}
+			}
+		}
 		for _, k := range []string{"reasoning", "text", "truncation", "include", "store", "previous_response_id"} {
 			if v, ok := c.original[k]; ok {
 				body[k] = v
 			}
 		}
+		if codex {
+			body["stream"] = true
+		}
 		return "responses", body
 	default:
 		body := cloneMap(c.chatBody)
 		body["model"] = t.Model
-		body["stream"] = c.upstreamStream()
+		wb := isWorkBuddy(t.Provider)
+		body["stream"] = c.upstreamStream() || wb
+		if wb {
+			normalizeWorkBuddyChat(body)
+		}
 		return "chat", body
 	}
+}
+
+func isWorkBuddy(p config.Provider) bool {
+	if strings.HasPrefix(p.Auth.Type, "workbuddy") {
+		return true
+	}
+	for _, a := range p.Accounts {
+		t := a.Auth.Type
+		if t == "" {
+			t = p.Auth.Type
+		}
+		if strings.HasPrefix(t, "workbuddy") {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeWorkBuddyChat translates request spellings WorkBuddy's chat endpoint
+// does not take, as its own client and magpie's verified plugin do.
+func normalizeWorkBuddyChat(body map[string]any) {
+	if v, ok := body["max_completion_tokens"]; ok {
+		if _, has := body["max_tokens"]; !has {
+			body["max_tokens"] = v
+		}
+		delete(body, "max_completion_tokens")
+	}
+	for _, raw := range protocol.Slice(body["messages"]) {
+		m := protocol.Map(raw)
+		if protocol.Str(m["role"]) == "developer" {
+			m["role"] = "system"
+		}
+	}
+	if tc := protocol.Map(body["tool_choice"]); len(tc) > 0 {
+		if name := protocol.Str(protocol.Map(tc["function"])["name"]); name != "" {
+			body["tool_choice"] = name
+		}
+	}
+}
+
+func isCodex(p config.Provider) bool {
+	return p.Protocol == config.ProtocolOpenAIResponses && p.Auth.Type == "codex-oauth"
+}
+
+// extraHeaders carries provider-specific per-model headers that cannot live in
+// the static provider config (the Codex backend wants the model in a routing
+// hint on every request).
+func extraHeaders(t router.Target, c *call) map[string]string {
+	if isCodex(t.Provider) {
+		return map[string]string{
+			"x-codex-routing-hint": "model=" + t.Model,
+		}
+	}
+	if isWorkBuddy(t.Provider) {
+		return auth.WorkBuddyChatHeaders()
+	}
+	return nil
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, c *call, t router.Target, resp *http.Response) (int, string) {
 	defer resp.Body.Close()
 
-	switch t.Provider.Protocol {
+	switch t.Protocol() {
 	case config.ProtocolAnthropic:
 		if c.streamFor(config.ProtocolAnthropic) {
 			streamHeaders(w)
@@ -296,7 +388,7 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, c *call, t route
 			_ = protocol.StreamAnthropicToChat(resp.Body, w, flush, c.model)
 			return 0, ""
 		}
-		doc, err := decodeUpstream(resp.Body)
+		doc, err := decodeAnthropicUpstream(resp)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "apx_upstream_shape", err.Error())
 			return 0, "shape"
@@ -325,13 +417,14 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, c *call, t route
 			}
 			return 0, ""
 		}
-		doc, err := decodeUpstream(resp.Body)
+		doc, err := decodeResponsesUpstream(resp)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "apx_upstream_shape", err.Error())
 			return 0, "shape"
 		}
 		if c.downstream == "responses" {
 			doc["model"] = c.model
+			protocol.EnsureOutputText(doc)
 			if c.stream {
 				streamHeaders(w)
 				emitResponsesSSE(w, flusher(w), doc, protocol.NewID("resp_"))
@@ -354,7 +447,7 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, c *call, t route
 			_ = protocol.StreamChatToResponses(resp.Body, w, flusher(w), c.model, protocol.NewID("resp_"))
 			return 0, ""
 		}
-		doc, err := decodeUpstream(resp.Body)
+		doc, err := decodeChatUpstream(resp)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "apx_upstream_shape", err.Error())
 			return 0, "shape"
@@ -495,6 +588,51 @@ func flusher(w http.ResponseWriter) func() {
 	return f.Flush
 }
 
+func decodeResponsesUpstream(resp *http.Response) (map[string]any, error) {
+	br := bufio.NewReader(resp.Body)
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "event-stream") {
+		return protocol.CollectResponsesSSE(br)
+	}
+	if peek, err := br.Peek(64); err == nil {
+		s := strings.TrimSpace(string(peek))
+		if strings.HasPrefix(s, "event:") || strings.HasPrefix(s, "data:") {
+			return protocol.CollectResponsesSSE(br)
+		}
+	}
+	return decodeUpstream(br)
+}
+
+func decodeChatUpstream(resp *http.Response) (map[string]any, error) {
+	br := bufio.NewReader(resp.Body)
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "event-stream") {
+		return protocol.CollectChatSSE(br)
+	}
+	if peek, err := br.Peek(64); err == nil {
+		s := strings.TrimSpace(string(peek))
+		if strings.HasPrefix(s, "data:") || strings.HasPrefix(s, "event:") {
+			return protocol.CollectChatSSE(br)
+		}
+	}
+	return decodeUpstream(br)
+}
+
+func decodeAnthropicUpstream(resp *http.Response) (map[string]any, error) {
+	br := bufio.NewReader(resp.Body)
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "event-stream") {
+		return protocol.CollectAnthropicSSE(br)
+	}
+	if peek, err := br.Peek(64); err == nil {
+		s := strings.TrimSpace(string(peek))
+		if strings.HasPrefix(s, "event:") || strings.HasPrefix(s, "data:") {
+			return protocol.CollectAnthropicSSE(br)
+		}
+	}
+	return decodeUpstream(br)
+}
+
 func decodeUpstream(r io.Reader) (map[string]any, error) {
 	raw, err := io.ReadAll(io.LimitReader(r, 32<<20))
 	if err != nil {
@@ -516,13 +654,25 @@ func usageTokensFromResponses(resp map[string]any) int {
 }
 
 func errorMessage(body map[string]any, status int) string {
+	if s, ok := body["error"].(string); ok && strings.TrimSpace(s) != "" {
+		return s
+	}
 	if e := protocol.Map(body["error"]); len(e) > 0 {
 		if msg := protocol.Str(e["message"]); msg != "" {
 			return msg
 		}
+		if code := protocol.Str(e["code"]); code != "" {
+			return code
+		}
 	}
 	if msg := protocol.Str(body["message"]); msg != "" {
 		return msg
+	}
+	if msg := protocol.Str(body["msg"]); msg != "" {
+		return msg
+	}
+	if code, ok := body["code"]; ok {
+		return fmt.Sprintf("上游 code %v", code)
 	}
 	return fmt.Sprintf("上游返回 HTTP %d", status)
 }
@@ -567,4 +717,40 @@ func toAnyTools(in []map[string]any) []any {
 		out = append(out, t)
 	}
 	return out
+}
+
+// clientName is the downstream app label shown in the live flow.
+func clientName(r *http.Request) string {
+	if n := strings.TrimSpace(r.Header.Get("X-Client-Name")); n != "" {
+		return n
+	}
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	lower := strings.ToLower(ua)
+	switch {
+	case strings.Contains(lower, "coopanion"):
+		return "Coopanion"
+	case strings.Contains(lower, "openai"):
+		return "OpenAI SDK"
+	case strings.Contains(lower, "python"):
+		return "Python"
+	case strings.Contains(lower, "curl"):
+		return "curl"
+	case strings.Contains(lower, "node"):
+		return "Node"
+	case strings.Contains(lower, "go-http"):
+		return "Go"
+	case strings.Contains(lower, "chrome"), strings.Contains(lower, "edg/"):
+		return "浏览器"
+	}
+	if ua != "" {
+		name := ua
+		if i := strings.IndexAny(name, " /"); i > 0 {
+			name = name[:i]
+		}
+		if len(name) > 32 {
+			name = name[:32] + "…"
+		}
+		return name
+	}
+	return "客户端"
 }

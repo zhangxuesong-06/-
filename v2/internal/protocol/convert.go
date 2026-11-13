@@ -569,12 +569,12 @@ func ChatToResponsesResponse(chat map[string]any, model, id string) map[string]a
 	}
 	usage := Map(chat["usage"])
 	out := map[string]any{
-		"id":         firstNonEmpty(id, NewID("resp_")),
-		"object":     "response",
-		"created_at": nowUnix(),
-		"status":     status,
-		"model":      model,
-		"output":     output,
+		"id":          firstNonEmpty(id, NewID("resp_")),
+		"object":      "response",
+		"created_at":  nowUnix(),
+		"status":      status,
+		"model":       model,
+		"output":      output,
 		"output_text": text.String(),
 		"usage": map[string]any{
 			"input_tokens":  Int(usage["prompt_tokens"]),
@@ -648,6 +648,28 @@ func ResponsesToChatResponse(resp map[string]any, model string) map[string]any {
 			"total_tokens":      Int(usage["total_tokens"]),
 		},
 	}
+}
+
+// EnsureOutputText fills the convenience output_text field when an upstream
+// (Codex) omits it. Clients that read output items are unaffected.
+func EnsureOutputText(resp map[string]any) {
+	if s, _ := resp["output_text"].(string); s != "" {
+		return
+	}
+	var b strings.Builder
+	for _, raw := range Slice(resp["output"]) {
+		item := Map(raw)
+		if Str(item["type"]) != "message" {
+			continue
+		}
+		for _, part := range Slice(item["content"]) {
+			p := Map(part)
+			if Str(p["type"]) == "output_text" {
+				b.WriteString(Str(p["text"]))
+			}
+		}
+	}
+	resp["output_text"] = b.String()
 }
 
 func firstNonEmpty(v ...string) string {

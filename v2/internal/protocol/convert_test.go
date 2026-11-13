@@ -276,6 +276,79 @@ func keys(m map[string]bool) []string {
 	return out
 }
 
+func TestCollectChatSSE(t *testing.T) {
+	raw := strings.Join([]string{
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"he"}}]}`,
+		``,
+		`data: {"choices":[{"index":0,"delta":{"content":"llo"}}]}`,
+		``,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{\"a\":"}}]}}]}`,
+		``,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	out, err := CollectChatSSE(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := Map(Slice(out["choices"])[0])["message"].(map[string]any)
+	if Text(msg["content"]) != "hello" {
+		t.Fatalf("content = %v", msg["content"])
+	}
+	calls := Slice(msg["tool_calls"])
+	if len(calls) != 1 {
+		t.Fatalf("tool_calls = %v", calls)
+	}
+	if fn := Map(Map(calls[0])["function"]); Str(fn["arguments"]) != `{"a":1}` {
+		t.Fatalf("arguments = %v", fn["arguments"])
+	}
+}
+
+func TestCollectAnthropicSSE(t *testing.T) {
+	raw := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"m1","model":"claude","usage":{"input_tokens":3}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"f"}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	out, err := CollectAnthropicSSE(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Str(out["stop_reason"]) != "tool_use" {
+		t.Fatalf("stop = %v", out["stop_reason"])
+	}
+	blocks := Slice(out["content"])
+	if len(blocks) != 2 {
+		t.Fatalf("content = %v", blocks)
+	}
+	if Str(Map(blocks[0])["text"]) != "hi" {
+		t.Fatalf("text = %v", blocks[0])
+	}
+	if Map(Map(blocks[1])["input"])["a"] != float64(1) {
+		t.Fatalf("input = %v", blocks[1])
+	}
+}
+
 func TestNewIDUnique(t *testing.T) {
 	a, b := NewID("x_"), NewID("x_")
 	if a == b {

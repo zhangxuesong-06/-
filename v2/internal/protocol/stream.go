@@ -106,20 +106,20 @@ type toolStream struct {
 }
 
 type chatToResponses struct {
-	w        io.Writer
-	flush    func()
-	respID   string
-	model    string
-	created  int64
-	seq      int
-	text     strings.Builder
-	textID   string
-	textAdd  bool
-	tools    map[int]*toolStream
-	toolSeq  []int
-	finish   string
-	usage    map[string]any
-	done     bool
+	w         io.Writer
+	flush     func()
+	respID    string
+	model     string
+	created   int64
+	seq       int
+	text      strings.Builder
+	textID    string
+	textAdd   bool
+	tools     map[int]*toolStream
+	toolSeq   []int
+	finish    string
+	usage     map[string]any
+	done      bool
 	outputIdx int
 }
 
@@ -329,6 +329,260 @@ func (s *chatToResponses) finishStream() {
 		"type": "response.completed", "sequence_number": s.next(),
 		"response": s.responseObject(status, output),
 	})
+}
+
+// CollectResponsesSSE consumes a Responses event stream and returns the final
+// response object. Codex only speaks streaming, so a non-streaming downstream
+// request is served by buffering the stream here.
+func CollectResponsesSSE(r io.Reader) (map[string]any, error) {
+	br := bufio.NewReader(r)
+	var completed map[string]any
+	var failure map[string]any
+	for {
+		event, data, err := ReadSSE(br)
+		if err != nil {
+			break
+		}
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var doc map[string]any
+		if json.Unmarshal([]byte(data), &doc) != nil {
+			continue
+		}
+		typ := Str(doc["type"])
+		if typ == "" {
+			typ = event
+		}
+		switch typ {
+		case "response.completed", "response.done":
+			if resp := Map(doc["response"]); len(resp) > 0 {
+				completed = resp
+			}
+		case "response.failed", "error":
+			failure = doc
+		}
+	}
+	if completed != nil {
+		return completed, nil
+	}
+	if failure != nil {
+		msg := Str(Map(failure["error"])["message"])
+		if msg == "" {
+			msg = Str(failure["message"])
+		}
+		if msg == "" {
+			msg = "上游 Responses 流返回错误"
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return nil, fmt.Errorf("上游 Responses 流没有 response.completed")
+}
+
+// CollectChatSSE aggregates a Chat Completions stream into one chat response.
+// WorkBuddy only streams, so a non-streaming downstream request is served by
+// buffering its stream here.
+func CollectChatSSE(r io.Reader) (map[string]any, error) {
+	br := bufio.NewReader(r)
+	id, model, finish := "", "", ""
+	usage := map[string]any{}
+	var content strings.Builder
+	tools := map[int]*toolStream{}
+	var order []int
+	for {
+		_, data, err := ReadSSE(br)
+		if err != nil {
+			break
+		}
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			continue
+		}
+		if id == "" {
+			id = Str(chunk["id"])
+		}
+		if model == "" {
+			model = Str(chunk["model"])
+		}
+		if u := Map(chunk["usage"]); len(u) > 0 {
+			usage = u
+		}
+		for _, raw := range Slice(chunk["choices"]) {
+			choice := Map(raw)
+			if fr := Str(choice["finish_reason"]); fr != "" {
+				finish = fr
+			}
+			delta := Map(choice["delta"])
+			if c, ok := delta["content"].(string); ok {
+				content.WriteString(c)
+			}
+			for _, tcRaw := range Slice(delta["tool_calls"]) {
+				tc := Map(tcRaw)
+				idx := Int(tc["index"])
+				t := tools[idx]
+				if t == nil {
+					t = &toolStream{index: idx}
+					tools[idx] = t
+					order = append(order, idx)
+				}
+				if v := Str(tc["id"]); v != "" {
+					t.id = v
+				}
+				fn := Map(tc["function"])
+				if n := Str(fn["name"]); n != "" {
+					t.name = n
+				}
+				if a := Str(fn["arguments"]); a != "" {
+					t.args.WriteString(a)
+				}
+			}
+		}
+	}
+	if content.Len() == 0 && len(order) == 0 {
+		return nil, fmt.Errorf("上游 Chat 流没有内容")
+	}
+	msg := map[string]any{"role": "assistant", "content": content.String()}
+	var calls []any
+	for _, idx := range order {
+		t := tools[idx]
+		calls = append(calls, map[string]any{
+			"id": t.id, "type": "function",
+			"function": map[string]any{"name": t.name, "arguments": t.args.String()},
+		})
+	}
+	if len(calls) > 0 {
+		msg["tool_calls"] = calls
+		if content.Len() == 0 {
+			msg["content"] = nil
+		}
+		if finish == "" {
+			finish = "tool_calls"
+		}
+	}
+	if finish == "" {
+		finish = "stop"
+	}
+	if id == "" {
+		id = NewID("chatcmpl_")
+	}
+	if model == "" {
+		model = "workbuddy"
+	}
+	return map[string]any{
+		"id": id, "object": "chat.completion", "created": nowUnix(), "model": model,
+		"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
+		"usage":   usage,
+	}, nil
+}
+
+type anthropicBlock struct {
+	typ   string
+	id    string
+	name  string
+	text  strings.Builder
+	input strings.Builder
+}
+
+// CollectAnthropicSSE aggregates an Anthropic Messages stream into one message.
+func CollectAnthropicSSE(r io.Reader) (map[string]any, error) {
+	br := bufio.NewReader(r)
+	id, model, stop := "", "", ""
+	usage := map[string]any{}
+	blocks := map[int]*anthropicBlock{}
+	var order []int
+	for {
+		event, data, err := ReadSSE(br)
+		if err != nil {
+			break
+		}
+		if data == "" {
+			continue
+		}
+		var doc map[string]any
+		if json.Unmarshal([]byte(data), &doc) != nil {
+			continue
+		}
+		if event == "" {
+			event = Str(doc["type"])
+		}
+		switch event {
+		case "message_start":
+			msg := Map(doc["message"])
+			if id == "" {
+				id = Str(msg["id"])
+			}
+			if model == "" {
+				model = Str(msg["model"])
+			}
+			if u := Map(msg["usage"]); len(u) > 0 {
+				usage = u
+			}
+		case "content_block_start":
+			idx := Int(doc["index"])
+			cb := Map(doc["content_block"])
+			b := &anthropicBlock{typ: Str(cb["type"]), id: Str(cb["id"]), name: Str(cb["name"])}
+			if s := Str(cb["text"]); s != "" {
+				b.text.WriteString(s)
+			}
+			blocks[idx] = b
+			order = append(order, idx)
+		case "content_block_delta":
+			idx := Int(doc["index"])
+			b := blocks[idx]
+			if b == nil {
+				continue
+			}
+			d := Map(doc["delta"])
+			switch Str(d["type"]) {
+			case "text_delta":
+				b.text.WriteString(Str(d["text"]))
+			case "input_json_delta":
+				b.input.WriteString(Str(d["partial_json"]))
+			}
+		case "message_delta":
+			d := Map(doc["delta"])
+			if s := Str(d["stop_reason"]); s != "" {
+				stop = s
+			}
+			if u := Map(doc["usage"]); len(u) > 0 {
+				for k, v := range u {
+					usage[k] = v
+				}
+			}
+		}
+	}
+	if len(order) == 0 {
+		return nil, fmt.Errorf("上游 Anthropic 流没有内容")
+	}
+	var content []any
+	for _, idx := range order {
+		b := blocks[idx]
+		switch b.typ {
+		case "text":
+			content = append(content, map[string]any{"type": "text", "text": b.text.String()})
+		case "tool_use":
+			input := map[string]any{}
+			if s := b.input.String(); s != "" {
+				_ = json.Unmarshal([]byte(s), &input)
+			}
+			content = append(content, map[string]any{
+				"type": "tool_use", "id": b.id, "name": b.name, "input": input,
+			})
+		}
+	}
+	if id == "" {
+		id = NewID("msg_")
+	}
+	if stop == "" {
+		stop = "end_turn"
+	}
+	return map[string]any{
+		"id": id, "type": "message", "role": "assistant", "model": model,
+		"content": content, "stop_reason": stop, "usage": usage,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

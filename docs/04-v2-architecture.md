@@ -61,12 +61,22 @@ internal/gateway            HTTP 端点、并发/排队、诊断、最近请求�
 关键点：
 
 1. **`protocol` 是上游协议**，与下游协议解耦；转换发生在 `internal/protocol`。
-2. **`paths` 覆盖默认 URL**。默认规则只在 base 末尾补 `/v1`，但 Codex 的
+2. **`proxy` 可全局或按 provider 设置**。`chatgpt.com`、`sekirocloud` 这类被网络阻断的
+   上游走本地代理；localhost 自动绕过代理。
+3. **`paths` 覆盖默认 URL**。默认规则只在 base 末尾补 `/v1`，但 Codex 的
    `/backend-api/codex`、WorkBuddy 的 `/v2` 不是 OpenAI 根路径，所以显式给出
    `responses` / `chat` / `models`。
-3. **`discover`**：启动时和 `/api/reload` 时调用上游 `/models` 合并模型；
+4. **`discover`**：启动时和 `/api/reload` 时调用上游 `/models` 合并模型；
    失败只记录，不清空静态模型。
-4. **`auth` 每请求解析**，宿主刷新 token 后 apx 不需要重启。
+5. **`auth` 每请求解析**，宿主刷新 token 后 apx 不需要重启。Codex 还需要客户端识别头，
+   这些头在 `codex-oauth` 里自动生成；模型路由提示在请求时补上。
+6. **模型可单独停用**：`Model.Disabled` 让模型留在目录里但不对外暴露；
+   provider 的 `Disabled` 则整家停供。
+7. **`tlsMax`**：部分中转站（sekirocloud）Go TLS 1.3 握手会挂起，固定 `1.2`；
+   apx 也会在 handshake timeout 时自动降级重试。
+8. **管理 API**：`/api/providers`、`/api/providers/{id}`（停止供应/模型开关）、
+   `/key`、`/discover`、`/test`、`/api/groups`，全部要求 apx token，写回
+   `providers.json` 后热重载 router。
 
 ---
 

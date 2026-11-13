@@ -4,12 +4,15 @@ package upstream
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"apx2/internal/auth"
@@ -17,11 +20,21 @@ import (
 )
 
 type Client struct {
-	HTTP *http.Client
+	HTTP    *http.Client
+	Proxy   string
+	Timeout time.Duration
+
+	mu         sync.Mutex
+	transports map[string]*http.Transport
 }
 
-func NewClient(timeout time.Duration) *Client {
-	return &Client{HTTP: &http.Client{Timeout: timeout}}
+func NewClient(timeout time.Duration, proxy string) *Client {
+	return &Client{
+		HTTP:       &http.Client{Timeout: timeout},
+		Proxy:      proxy,
+		Timeout:    timeout,
+		transports: map[string]*http.Transport{},
+	}
 }
 
 // Endpoint resolves a logical endpoint (chat, responses, models, messages) for a
@@ -73,12 +86,31 @@ type Request struct {
 	Method   string
 	Body     any
 	Auth     auth.Resolver
+	Headers  map[string]string
 }
 
 func (c *Client) Do(ctx context.Context, r Request) (*http.Response, error) {
 	if r.Method == "" {
 		r.Method = http.MethodPost
 	}
+	resp, err := c.doOnce(ctx, r, "")
+	if err != nil && r.Provider.TLSMax == "" && isTLSHandshakeTimeout(err) {
+		// Some relays (sekirocloud) fail the Go TLS 1.3 handshake but accept
+		// TLS 1.2. Retry once with TLS 1.2 instead of reporting a dead upstream.
+		return c.doOnce(ctx, r, "1.2")
+	}
+	return resp, err
+}
+
+func (c *Client) doOnce(ctx context.Context, r Request, forceTLS string) (*http.Response, error) {
+	req, err := c.newRequest(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return c.clientFor(r.Provider, forceTLS).Do(req)
+}
+
+func (c *Client) newRequest(ctx context.Context, r Request) (*http.Request, error) {
 	var body io.Reader
 	if r.Body != nil {
 		b, err := json.Marshal(r.Body)
@@ -93,6 +125,7 @@ func (c *Client) Do(ctx context.Context, r Request) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("User-Agent", "apx2/2.0")
 	if r.Auth != nil {
 		headers, err := r.Auth(ctx)
 		if err != nil {
@@ -107,14 +140,85 @@ func (c *Client) Do(ctx context.Context, r Request) (*http.Response, error) {
 	for k, v := range r.Provider.Headers {
 		req.Header.Set(k, v)
 	}
-	client := c.HTTP
-	if r.Provider.TimeoutSeconds > 0 {
-		client = &http.Client{Timeout: time.Duration(r.Provider.TimeoutSeconds) * time.Second}
+	for k, v := range r.Headers {
+		req.Header.Set(k, v)
 	}
-	return client.Do(req)
+	return req, nil
+}
+
+func (c *Client) clientFor(p config.Provider, forceTLS string) *http.Client {
+	timeout := c.Timeout
+	if p.TimeoutSeconds > 0 {
+		timeout = time.Duration(p.TimeoutSeconds) * time.Second
+	}
+	tlsMax := p.TLSMax
+	if forceTLS != "" {
+		tlsMax = forceTLS
+	}
+	proxy := firstNonEmpty(p.Proxy, c.Proxy)
+	if proxy == "" && tlsMax == "" {
+		return &http.Client{Timeout: timeout}
+	}
+	tr := c.transport(proxy, tlsMax)
+	if tr == nil {
+		return &http.Client{Timeout: timeout}
+	}
+	return &http.Client{Timeout: timeout, Transport: tr}
+}
+
+func (c *Client) transport(proxy, tlsMax string) *http.Transport {
+	key := proxy + "|" + tlsMax
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if tr, ok := c.transports[key]; ok {
+		return tr
+	}
+	base := http.DefaultTransport.(*http.Transport)
+	tr := base.Clone()
+	if proxy == "" {
+		tr.Proxy = nil
+	} else {
+		u, err := url.Parse(proxy)
+		if err != nil || u.Host == "" {
+			return nil
+		}
+		tr.Proxy = func(req *http.Request) (*url.URL, error) {
+			host := req.URL.Hostname()
+			if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+				return nil, nil
+			}
+			return u, nil
+		}
+	}
+	if tlsMax != "" {
+		var max uint16
+		switch tlsMax {
+		case "1.2":
+			max = tls.VersionTLS12
+		case "1.3":
+			max = tls.VersionTLS13
+		}
+		if max != 0 {
+			if tr.TLSClientConfig != nil {
+				tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+			} else {
+				tr.TLSClientConfig = &tls.Config{}
+			}
+			tr.TLSClientConfig.MaxVersion = max
+		}
+	}
+	c.transports[key] = tr
+	return tr
+}
+
+func isTLSHandshakeTimeout(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "TLS handshake timeout")
 }
 
 func (c *Client) ListModels(ctx context.Context, p config.Provider, resolver auth.Resolver, timeout time.Duration) ([]config.Model, error) {
+	if isWorkBuddyProvider(p) {
+		return c.listWorkBuddyModels(ctx, p, resolver, timeout)
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	resp, err := c.Do(ctx, Request{Provider: p, Kind: "models", Method: http.MethodGet, Auth: resolver})

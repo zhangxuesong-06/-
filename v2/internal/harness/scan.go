@@ -5,6 +5,7 @@ package harness
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -159,10 +160,11 @@ func scanCodex(ctx context.Context) Finding {
 	f.Provider = &config.Provider{
 		ID: "codex", Name: "Codex", Protocol: config.ProtocolOpenAIResponses,
 		BaseURL: "https://chatgpt.com/backend-api/codex",
+		Proxy:   firstNonEmpty(os.Getenv("APX_PROXY"), "http://127.0.0.1:7901"),
 		Auth:    config.AuthConfig{Type: "codex-oauth", File: "~/.codex/auth.json"},
 		Paths:   map[string]string{"responses": "/responses", "models": "/models"},
 		Models:  list, Source: "scan",
-		Notes: "直连 ChatGPT OAuth；本机网络若不可达则请求会失败，apx 会如实报错。",
+		Notes: "直连 ChatGPT OAuth；chatgpt.com 在本机需要经由本地代理（默认 127.0.0.1:7901，可用 APX_PROXY 覆盖）。",
 	}
 	return f
 }
@@ -180,7 +182,7 @@ func readCodexModel() string {
 }
 
 func scanZcode() Finding {
-	f := Finding{ID: "zcode", Name: "Zcode / GLM Coding Plan", Kind: "harness"}
+	f := Finding{ID: "zcode", Name: "Zcode 中转站 (GPT)", Kind: "harness"}
 	path := expandHome("~/.zcode/v2/provider_config.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -229,54 +231,92 @@ func scanZcode() Finding {
 		protocol = config.ProtocolOpenAIChat
 	}
 	if f.Available {
-		f.Healthy = probeModels(context.Background(), base, map[string]string{
+		ids, healthy := probeModelList(context.Background(), base, map[string]string{
 			"Authorization": "Bearer " + key, "x-api-key": key, "anthropic-version": "2023-06-01",
-		})
-		if f.Healthy != nil && !*f.Healthy {
+		}, "1.2")
+		f.Healthy = healthy
+		f.Models = ids
+		if len(ids) > 0 {
+			f.Detail = fmt.Sprintf("%s；发现 %d 个模型", f.Detail, len(ids))
+		}
+		if healthy != nil && !*healthy {
 			f.Note = "key 已存在但端点拒绝/不可达；运行 apx auth set zcode --key 换新 key，或在 providers.json 里改 baseUrl。" + f.Note
 		}
 	}
-	f.Models = []string{"glm-5.3", "glm-5.2", "glm-4.6"}
+	if len(f.Models) == 0 {
+		// Offline fallback for the relay we know Zcode points at.
+		f.Models = []string{"gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.5"}
+	}
 	list := make([]config.Model, 0, len(f.Models))
 	for _, m := range f.Models {
 		list = append(list, config.Model{ID: m})
 	}
 	f.Provider = &config.Provider{
-		ID: "zcode", Name: "Zcode (GLM)", Protocol: protocol,
+		ID: "zcode", Name: "Zcode 中转站", Protocol: protocol,
 		BaseURL: base,
-		Auth:    config.AuthConfig{Type: "zcode-key", Env: "APX_ZCODE_KEY"},
+		TLSMax:  "1.2",
+		Auth:    config.AuthConfig{Type: "zcode-config", File: "~/.zcode/v2/provider_config.json"},
 		Models:  list, Discover: true, Source: "scan",
-		Notes: "baseUrl 取自 Zcode 自己的配置；如果换用官方端点，改成 https://open.bigmodel.cn/api/anthropic（Anthropic 协议）或 https://api.z.ai/api/anthropic。",
+		Notes: "上游是 Zcode 自己的中转站；该站的 Go TLS 1.3 握手会超时，固定 TLS 1.2。模型以 /models 发现为准。",
 	}
 	return f
 }
 
-func probeModels(ctx context.Context, base string, headers map[string]string) *bool {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+func modelsURL(base string) string {
 	base = strings.TrimRight(base, "/")
-	url := base + "/v1/models"
 	if strings.HasSuffix(base, "/v1") {
-		url = base + "/models"
+		return base + "/models"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	return base + "/v1/models"
+}
+
+// probeModelList checks a provider and, when it exposes /models, returns the
+// model ids. It can force TLS 1.2 for relays whose TLS 1.3 handshake hangs.
+func probeModelList(ctx context.Context, base string, headers map[string]string, tlsMax string) ([]string, *bool) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL(base), nil)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if tlsMax == "1.2" {
+		tr.TLSClientConfig = &tls.Config{MaxVersion: tls.VersionTLS12}
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second, Transport: tr}).Do(req)
 	if err != nil {
 		no := false
-		return &no
+		return nil, &no
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil // endpoint shape unknown; do not claim the key is bad
+		return nil, nil // endpoint shape unknown; do not claim the key is bad
 	}
 	ok := resp.StatusCode < 400
-	return &ok
+	if !ok {
+		return nil, &ok
+	}
+	var doc struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&doc)
+	ids := make([]string, 0, len(doc.Data))
+	for _, m := range doc.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, &ok
+}
+
+func probeModels(ctx context.Context, base string, headers map[string]string) *bool {
+	_, healthy := probeModelList(ctx, base, headers, "")
+	return healthy
 }
 
 func scanWorkBuddy() Finding {
@@ -319,31 +359,49 @@ func scanWorkBuddy() Finding {
 	if raw, err := os.ReadFile(desktop); err == nil {
 		encrypted = strings.Contains(string(raw), "wbEncrypted") || strings.Contains(string(raw), "enc:v1:")
 	}
-	f.Available = key != ""
-	if key != "" {
+	tokenPath := expandHome("~/.apx2/auth/workbuddy.json")
+	_, tokenErr := os.Stat(tokenPath)
+	tokenExists := tokenErr == nil
+	f.Available = key != "" || tokenExists
+	if tokenExists {
+		f.Detail = strings.TrimSpace(f.Detail + "；已保存 WorkBuddy OAuth 登录")
+		f.Note = "OAuth token 在 " + tokenPath + "；可点控制台的「登录」重新登录。"
+	} else if key != "" {
 		f.Detail = "已配置 API key（" + tail(key, 4) + "）"
 		f.Healthy = probeModels(context.Background(), "https://copilot.tencent.com/v2", map[string]string{
 			"X-API-Key": key, "Authorization": "Bearer " + key,
 		})
 	} else {
-		f.Note = "WorkBuddy 桌面登录文件是加密的，apx 不解密。请用 `apx auth set workbuddy --key <key>` 写入 WorkBuddy 自己的 API key。"
+		f.Note = "可点控制台里 WorkBuddy 的「登录」完成浏览器登录（照 magpie 验证过的流程），或 `apx auth set workbuddy --key <key>` 写入 API key。apx 不解密桌面的加密登录文件。"
 		if encrypted {
 			f.Note = "桌面登录文件已确认加密；" + f.Note
 		}
 	}
-	models := []string{"deepseek-v4.1-flash", "glm-5.3-flash", "glm-5.3", "glm-5.2", "gpt-6-astra", "gpt-6.1-sol"}
+	models := []string{"deepseek-v4.1-flash", "glm-5.3-flash", "glm-5.3", "glm-5.2", "gpt-6-astra", "gpt-6.1-sol",
+		"claude-opus-5.5", "claude-sonnet-5.5", "claude-opus-5", "claude-opus-4.8-1m"}
 	f.Models = models
 	list := make([]config.Model, 0, len(models))
 	for _, m := range models {
-		list = append(list, config.Model{ID: m})
+		proto := ""
+		if strings.HasPrefix(m, "claude-") {
+			proto = config.ProtocolAnthropic
+		}
+		list = append(list, config.Model{ID: m, Protocol: proto})
+	}
+	authCfg := config.AuthConfig{Type: "workbuddy-oauth", File: "~/.apx2/auth/workbuddy.json"}
+	if key != "" && !tokenExists {
+		authCfg = config.AuthConfig{Type: "workbuddy-key", Env: "APX_WORKBUDDY_KEY"}
 	}
 	f.Provider = &config.Provider{
 		ID: "workbuddy", Name: "WorkBuddy", Protocol: config.ProtocolOpenAIChat,
-		BaseURL: "https://copilot.tencent.com/v2",
-		Auth:    config.AuthConfig{Type: "workbuddy-key", Env: "APX_WORKBUDDY_KEY"},
-		Paths:   map[string]string{"chat": "/chat/completions", "models": "/models"},
-		Models:  list, Discover: true, Source: "scan",
-		Notes: "中国版端点 copilot.tencent.com/v2；国际版把 baseUrl 改成 https://www.workbuddy.ai/v2。模型名来自 WorkBuddy 自己的 models.json。",
+		BaseURL: "https://copilot.tencent.com",
+		Auth:    authCfg,
+		Paths: map[string]string{
+			"chat":     "/v2/chat/completions",
+			"messages": "/v1/messages",
+		},
+		Models: list, Discover: true, Source: "scan",
+		Notes: "中国版端点 copilot.tencent.com；Claude 模型走 /v1/messages，其它走 /v2/chat/completions。模型以 /v3/config 发现为准。",
 	}
 	return f
 }
@@ -429,6 +487,15 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func joinKeys(m map[string]bool) string {

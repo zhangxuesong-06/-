@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -15,11 +16,22 @@ const (
 	ProtocolAnthropic       = "anthropic"
 )
 
+type Account struct {
+	ID       string     `json:"id"`
+	Name     string     `json:"name,omitempty"`
+	Models   []string   `json:"models,omitempty"` // empty = all provider models
+	Auth     AuthConfig `json:"auth,omitempty"`
+	Disabled bool       `json:"disabled,omitempty"`
+}
+
 type Provider struct {
 	ID             string            `json:"id"`
 	Name           string            `json:"name,omitempty"`
 	Protocol       string            `json:"protocol"`
 	BaseURL        string            `json:"baseUrl"`
+	Proxy          string            `json:"proxy,omitempty"`
+	TLSMax         string            `json:"tlsMax,omitempty"` // "1.2" forces TLS 1.2 for relays that break TLS 1.3
+	Accounts       []Account         `json:"accounts,omitempty"`
 	Auth           AuthConfig        `json:"auth"`
 	Models         []Model           `json:"models,omitempty"`
 	Discover       bool              `json:"discover,omitempty"`
@@ -34,8 +46,10 @@ type Provider struct {
 type Model struct {
 	ID              string `json:"id"`
 	Name            string `json:"name,omitempty"`
+	Protocol        string `json:"protocol,omitempty"` // per-model override, e.g. Claude on Anthropic
 	ContextWindow   int    `json:"contextWindow,omitempty"`
 	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"`
+	Disabled        bool   `json:"disabled,omitempty"`
 }
 
 type AuthConfig struct {
@@ -52,6 +66,8 @@ type Group struct {
 	Name      string   `json:"name,omitempty"`
 	Strategy  string   `json:"strategy,omitempty"` // order | rotate | usage
 	Providers []string `json:"providers"`
+	Auto      bool     `json:"auto,omitempty"`
+	Model     string   `json:"model,omitempty"`
 }
 
 type Registry struct {
@@ -98,6 +114,18 @@ func normalizeProvider(p *Provider) {
 		p.Name = p.ID
 	}
 	p.BaseURL = strings.TrimRight(p.BaseURL, "/")
+	seen := map[string]bool{}
+	accounts := make([]Account, 0, len(p.Accounts))
+	for _, a := range p.Accounts {
+		a.ID = strings.TrimSpace(a.ID)
+		if a.ID == "" || seen[a.ID] {
+			continue
+		}
+		seen[a.ID] = true
+		a.Models = dedupeList(a.Models)
+		accounts = append(accounts, a)
+	}
+	p.Accounts = accounts
 }
 
 func (r Registry) Provider(id string) (Provider, bool) {
@@ -118,6 +146,101 @@ func (r Registry) Group(id string) (Group, bool) {
 	return Group{}, false
 }
 
+// GroupsWithAuto returns the user's groups plus generated groups for models
+// supplied by two or more enabled providers. Generated groups are not persisted.
+func (r Registry) GroupsWithAuto() []Group {
+	out := append([]Group(nil), r.Groups...)
+	userIDs := make(map[string]bool, len(r.Groups))
+	for _, g := range r.Groups {
+		userIDs[g.ID] = true
+	}
+	byModel := map[string][]string{}
+	for _, p := range r.Providers {
+		if p.Disabled {
+			continue
+		}
+		for _, m := range p.Models {
+			if m.Disabled || m.ID == "" {
+				continue
+			}
+			if !containsString(byModel[m.ID], p.ID) {
+				byModel[m.ID] = append(byModel[m.ID], p.ID)
+			}
+		}
+	}
+	var models []string
+	for model, providers := range byModel {
+		if len(providers) >= 2 {
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		id := AutoGroupID(model)
+		if userIDs[id] {
+			continue
+		}
+		out = append(out, Group{
+			ID: id, Name: "同模型 · " + model, Strategy: "order",
+			Providers: byModel[model], Auto: true, Model: model,
+		})
+	}
+	return out
+}
+
+// AutoGroupID turns a model id into a stable, addressable group id.
+func AutoGroupID(model string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(model) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	id := strings.Trim(b.String(), "-.")
+	if id == "" {
+		id = "model"
+	}
+	if len(id) > 48 {
+		id = id[:48]
+	}
+	return "same-" + id
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func dedupeList(list []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func (p Provider) Account(id string) (Account, bool) {
+	for _, a := range p.Accounts {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return Account{}, false
+}
+
 // ModelIDs returns every model address the gateway can advertise, in the
 // magpie style: provider/model for direct providers plus group/model for each
 // group/model combination that exists on at least one group provider.
@@ -135,6 +258,9 @@ func (r Registry) ModelIDs() []string {
 			continue
 		}
 		for _, m := range p.Models {
+			if m.Disabled {
+				continue
+			}
 			add(p.ID + "/" + m.ID)
 		}
 	}
@@ -145,6 +271,9 @@ func (r Registry) ModelIDs() []string {
 				continue
 			}
 			for _, m := range p.Models {
+				if m.Disabled {
+					continue
+				}
 				add(g.ID + "/" + m.ID)
 			}
 		}
@@ -154,8 +283,11 @@ func (r Registry) ModelIDs() []string {
 
 func (r Registry) FindModel(model string) (Provider, Model, bool) {
 	for _, p := range r.Providers {
+		if p.Disabled {
+			continue
+		}
 		for _, m := range p.Models {
-			if m.ID == model {
+			if m.ID == model && !m.Disabled {
 				return p, m, true
 			}
 		}

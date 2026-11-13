@@ -17,6 +17,7 @@ import (
 type Config struct {
 	Listen         string            `json:"listen"`
 	Token          string            `json:"token"`
+	Proxy          string            `json:"proxy,omitempty"`
 	TimeoutSeconds int               `json:"timeoutSeconds"`
 	Limits         Limits            `json:"limits"`
 	Aliases        map[string]string `json:"aliases"`
@@ -131,6 +132,9 @@ func Load() (Config, error) {
 			return cfg, err
 		}
 		cfg.Token = t
+	}
+	if cfg.Proxy == "" {
+		cfg.Proxy = os.Getenv("APX_PROXY")
 	}
 	return cfg, nil
 }

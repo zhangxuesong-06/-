@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"apx2/internal/auth"
 	"apx2/internal/config"
 	"apx2/internal/harness"
 	"apx2/internal/router"
@@ -22,6 +24,9 @@ type Server struct {
 	up  *upstream.Client
 	sem chan struct{}
 
+	active int64
+	queued int64
+
 	started time.Time
 
 	mu     sync.Mutex
@@ -30,13 +35,19 @@ type Server struct {
 	errs   int
 	tokens int64
 	lastAt time.Time
+
+	wbMu     sync.Mutex
+	wbLogins map[string]*wbLoginState
 }
 
 type RequestRecord struct {
 	At         string `json:"at"`
 	Path       string `json:"path"`
+	Client     string `json:"client,omitempty"`
 	Model      string `json:"model,omitempty"`
 	Provider   string `json:"provider,omitempty"`
+	Account    string `json:"account,omitempty"`
+	AccountID  string `json:"accountId,omitempty"`
 	Group      string `json:"group,omitempty"`
 	Stream     bool   `json:"stream"`
 	Status     int    `json:"status"`
@@ -49,11 +60,12 @@ type RequestRecord struct {
 
 func New(cfg config.Config, rt *router.Router) *Server {
 	return &Server{
-		cfg:     cfg,
-		rt:      rt,
-		up:      upstream.NewClient(time.Duration(cfg.TimeoutSeconds) * time.Second),
-		sem:     make(chan struct{}, max(1, cfg.Limits.MaxConcurrent)),
-		started: time.Now(),
+		cfg:      cfg,
+		rt:       rt,
+		up:       upstream.NewClient(time.Duration(cfg.TimeoutSeconds)*time.Second, cfg.Proxy),
+		sem:      make(chan struct{}, max(1, cfg.Limits.MaxConcurrent)),
+		started:  time.Now(),
+		wbLogins: map[string]*wbLoginState{},
 	}
 }
 
@@ -77,6 +89,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/health":
 		s.handleHealth(w, r)
 		return
+	case "/assets/workbuddy.png":
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		_, _ = w.Write(workbuddyPNG)
+		return
 	case "/api/status":
 		s.handleStatus(w, r)
 		return
@@ -84,7 +101,23 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleScan(w, r)
 		return
 	case "/api/reload":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "apx_method_not_allowed", "uses POST")
+			return
+		}
+		if !s.authorized(r) {
+			writeError(w, http.StatusUnauthorized, "apx_unauthorized", "缺少或错误的本地令牌")
+			return
+		}
 		s.handleReload(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/providers") || strings.HasPrefix(r.URL.Path, "/api/groups") {
+		if !s.authorized(r) {
+			writeError(w, http.StatusUnauthorized, "apx_unauthorized", "缺少或错误的本地令牌")
+			return
+		}
+		s.handleAdmin(w, r)
 		return
 	}
 
@@ -121,15 +154,25 @@ func (s *Server) authorized(r *http.Request) bool {
 func (s *Server) acquire(w http.ResponseWriter, r *http.Request, fn func(http.ResponseWriter, *http.Request)) {
 	select {
 	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
+		atomic.AddInt64(&s.active, 1)
+		defer func() {
+			<-s.sem
+			atomic.AddInt64(&s.active, -1)
+		}()
 		fn(w, r)
 	default:
 		timeout := time.Duration(s.cfg.Limits.QueueTimeoutMS) * time.Millisecond
 		t := time.NewTimer(timeout)
 		defer t.Stop()
+		atomic.AddInt64(&s.queued, 1)
+		defer atomic.AddInt64(&s.queued, -1)
 		select {
 		case s.sem <- struct{}{}:
-			defer func() { <-s.sem }()
+			atomic.AddInt64(&s.active, 1)
+			defer func() {
+				<-s.sem
+				atomic.AddInt64(&s.active, -1)
+			}()
 			fn(w, r)
 		case <-t.C:
 			writeError(w, http.StatusServiceUnavailable, "apx_queue_timeout", "并发已满，排队超时")
@@ -176,6 +219,9 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			continue
 		}
 		for _, m := range p.Models {
+			if m.Disabled {
+				continue
+			}
 			add(p.ID+"/"+m.ID, p.ID, m)
 		}
 	}
@@ -186,6 +232,9 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 				continue
 			}
 			for _, m := range p.Models {
+				if m.Disabled {
+					continue
+				}
 				add(g.ID+"/"+m.ID, g.ID, m)
 			}
 		}
@@ -196,7 +245,9 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			continue
 		}
 		for _, m := range p.Models {
-			unique[m.ID] = append(unique[m.ID], m)
+			if !m.Disabled {
+				unique[m.ID] = append(unique[m.ID], m)
+			}
 		}
 	}
 	for id, list := range unique {
@@ -211,26 +262,59 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	reg := s.rt.Registry()
 	health := s.rt.HealthSnapshot()
 
+	type accountView struct {
+		ID       string         `json:"id"`
+		Name     string         `json:"name,omitempty"`
+		Label    string         `json:"label"`
+		Models   []string       `json:"models,omitempty"`
+		Disabled bool           `json:"disabled"`
+		KeySet   bool           `json:"keySet"`
+		Health   *router.Health `json:"health,omitempty"`
+	}
 	type providerView struct {
 		ID       string         `json:"id"`
 		Name     string         `json:"name"`
 		Protocol string         `json:"protocol"`
 		BaseURL  string         `json:"baseUrl"`
+		Proxy    string         `json:"proxy,omitempty"`
+		TLSMax   string         `json:"tlsMax,omitempty"`
 		Discover bool           `json:"discover"`
 		Disabled bool           `json:"disabled"`
 		Notes    string         `json:"notes,omitempty"`
-		Models   []string       `json:"models"`
+		AuthType string         `json:"authType,omitempty"`
+		KeySet   bool           `json:"keySet"`
+		Account  auth.Identity  `json:"account"`
+		Accounts []accountView  `json:"accounts,omitempty"`
+		Models   []config.Model `json:"models"`
 		Health   *router.Health `json:"health,omitempty"`
 	}
 	providers := make([]providerView, 0, len(reg.Providers))
 	for _, p := range reg.Providers {
-		ids := make([]string, 0, len(p.Models))
-		for _, m := range p.Models {
-			ids = append(ids, m.ID)
+		keySet := keyAvailable(p)
+		if len(p.Accounts) > 0 {
+			keySet = false
 		}
 		view := providerView{
 			ID: p.ID, Name: p.Name, Protocol: p.Protocol, BaseURL: p.BaseURL,
-			Discover: p.Discover, Disabled: p.Disabled, Notes: p.Notes, Models: ids,
+			Proxy: p.Proxy, TLSMax: p.TLSMax, Discover: p.Discover, Disabled: p.Disabled,
+			Notes: p.Notes, AuthType: p.Auth.Type, KeySet: keySet, Models: p.Models,
+			Account: auth.Describe(p),
+		}
+		for i := range p.Accounts {
+			a := p.Accounts[i]
+			av := accountView{
+				ID: a.ID, Name: a.Name, Disabled: a.Disabled,
+				Label:  auth.DescribeAccount(p, &a).Label,
+				Models: a.Models,
+				KeySet: accountKeyAvailable(p, a),
+			}
+			if av.KeySet {
+				view.KeySet = true
+			}
+			if h, ok := health[p.ID+"#"+a.ID]; ok {
+				av.Health = &h
+			}
+			view.Accounts = append(view.Accounts, av)
 		}
 		if h, ok := health[p.ID]; ok {
 			view.Health = &h
@@ -244,20 +328,51 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"running":  true,
-		"version":  Version,
-		"listen":   s.cfg.Listen,
-		"baseURL":  "http://" + s.cfg.Listen + "/v1",
-		"token":    s.cfg.Token,
-		"uptime":   time.Since(s.started).Round(time.Second).String(),
+		"running":   true,
+		"version":   Version,
+		"listen":    s.cfg.Listen,
+		"baseURL":   "http://" + s.cfg.Listen + "/v1",
+		"token":     s.cfg.Token,
+		"uptime":    time.Since(s.started).Round(time.Second).String(),
 		"providers": providers,
-		"groups":    reg.Groups,
+		"groups":    reg.GroupsWithAuto(),
 		"models":    reg.ModelIDs(),
 		"requests":  reqs,
 		"errors":    errs,
 		"tokens":    tokens,
 		"recent":    recent,
+		"concurrency": map[string]any{
+			"active": atomic.LoadInt64(&s.active),
+			"queued": atomic.LoadInt64(&s.queued),
+			"limit":  cap(s.sem),
+		},
 	})
+}
+
+// keyAvailable reports whether the provider's credential can be resolved right
+// now. It never returns the secret itself.
+func keyAvailable(p config.Provider) bool {
+	_, err := authFor(p)(context.Background())
+	return err == nil
+}
+
+// providerAuth uses the first enabled account when a provider has a pool, and
+// the default credential otherwise. Discovery/test only need one usable key.
+func providerAuth(p config.Provider) auth.Resolver {
+	for i := range p.Accounts {
+		if p.Accounts[i].Disabled {
+			continue
+		}
+		a := p.Accounts[i]
+		return auth.BuildAccount(p, &a)
+	}
+	return auth.Build(p)
+}
+
+func accountKeyAvailable(p config.Provider, a config.Account) bool {
+	acct := a
+	_, err := auth.BuildAccount(p, &acct)(context.Background())
+	return err == nil
 }
 
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
@@ -296,7 +411,7 @@ func (s *Server) RefreshModels(ctx context.Context) []string {
 		if !p.Discover || p.Disabled {
 			continue
 		}
-		models, err := s.up.ListModels(ctx, *p, authFor(*p), 8*time.Second)
+		models, err := s.up.ListModels(ctx, *p, providerAuth(*p), 8*time.Second)
 		if err != nil {
 			notes = append(notes, fmt.Sprintf("%s: %v", p.ID, err))
 			continue
