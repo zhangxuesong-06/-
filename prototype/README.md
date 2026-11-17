@@ -1,4 +1,7 @@
-# apx — Agent Proxy Launcher（可运行原型）
+# apx — Agent Proxy Launcher（v1 原型 / 已归档）
+
+> **v1 已归档，不再新增功能。** 当前主线是 `v2/`（Go 单二进制网关）；本目录只用于回滚、历史证据与 v1 兼容性参考。
+> 当前基线与启动入口见 `../CURRENT.md`、`../v2/README.md`。
 
 把本机某个 agent 的模型能力，变成 `http://127.0.0.1:<port>/v1` 这样一个标准 OpenAI 端点，供本机任何需要模型的程序使用。
 

@@ -1,12 +1,14 @@
-# 交付状态（可发布）
+# v1 原型交付状态（归档）
+
+> **注意：v1 已归档，当前主线是 `v2/`。**
+> 新功能、发布与验收请以 `CURRENT.md`、`v2/README.md`、`docs/05-v2-delivery.md` 为准；本文件仅保留 v1 历史证据与回滚依据。
 
 | 项 | 内容 |
 |---|---|
-| 日期 | 2026-11-04（13:55 二次增量后复验） |
-| 结论 | **可发布**。最新增量（提供方软件识别 + 响应格式兼容加固）后：QA 验收 **15/15 全过**；`npm run test:all` **229 项 / 0 失败** |
-| 被测快照 | `prototype/` 下 `src` + `test` + `adapters` + `package.json` + `README.md` 共 33 个跟踪文件；本轮增量改 `src/proxy/server.mjs`、`src/runtime/controller.mjs`、`src/console/ui.html`、`test/smoke.mjs`、`test/e2e-real.mjs`、`README.md` |
+| 日期 | 2026-11-04（v1 最终状态；2026-11-17 标记为归档） |
+| 结论 | v1 原型可回滚；当前不再作为主线 |
+| 被测快照 | `prototype/` 下 `src` + `test` + `adapters` + `package.json` + `README.md` |
 | 复现 | `cd prototype && node test/qa-acceptance.mjs`（exit 0 = 全过） |
-| 自有回归 | `npm run test:all` → **229 项 / 0 失败**（smoke 52 / probe 23 / token 17 / console 54 / stop-safety 17 / adapters 49 / e2e-real 17） |
 
 > QA 结论已对**当前最新代码**复跑通过；不是只对改动前快照有效。`58241` 仍因本机无监听按假上游等价覆盖。
 

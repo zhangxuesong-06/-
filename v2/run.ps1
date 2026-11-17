@@ -6,7 +6,21 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $exe = Join-Path $root 'bin\apx2.exe'
 $gui = Join-Path $root 'bin\apx2w.exe'
-$go = Join-Path $env:LOCALAPPDATA 'Programs\Go\go\bin\go.exe'
+
+function Resolve-Go {
+    $cmd = Get-Command go -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Go\go\bin\go.exe'),
+        'C:\Program Files\Go\bin\go.exe',
+        'C:\Go\bin\go.exe',
+        (Join-Path $env:USERPROFILE 'scoop\apps\go\current\bin\go.exe')
+    )
+    foreach ($p in $candidates) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    throw 'Go not found. Install Go 1.24+ or add go.exe to PATH.'
+}
 
 $needBuild = (-not (Test-Path $exe)) -or (-not (Test-Path $gui))
 if (-not $needBuild) {
@@ -17,6 +31,7 @@ if (-not $needBuild) {
     $needBuild = $newest -and $newest.LastWriteTime -gt $built
 }
 if ($needBuild) {
+    $go = Resolve-Go
     Push-Location $root
     try {
         & $go build -o $exe ./cmd/apx

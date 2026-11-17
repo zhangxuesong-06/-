@@ -1,5 +1,9 @@
 # apx2 · 本地多 provider 模型网关
 
+> 当前主线：**v2**。v1 原型在 `../prototype/`，只用于回滚参考。
+> 目标平台：**Windows 优先**；Linux/macOS 后续扩展。
+> 当前状态与优先级见仓库根目录 `../CURRENT.md`。
+
 apx2 是一个 Go 单二进制本地网关，**按 magpie 的思路重写，但不使用、不依赖、不修改 magpie**，也不碰它的 `3425` 端口和 `plugin-auth.json`。
 
 它把本机已有软件（Ollama、WorkBuddy、Codex、Zcode…）的模型通道收进来，在 `127.0.0.1:8787/v1` 暴露成 OpenAI 兼容端点，用一个 apx 自己的本地 key 给下游（比如 Coopanion 桌宠）使用。
@@ -33,6 +37,14 @@ go build -o bin/apx2.exe ./cmd/apx
 # 启动网关
 .\bin\apx2.exe serve
 ```
+
+基线检查（Go 1.24+，测试 + vet）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\check.ps1
+```
+
+`bin/`、日志、`.apx2/` 与凭据文件已在根目录 `.gitignore` 中排除，不会被误提交。
 
 桌面上还有一个一键启动快捷方式 **「apx2 模型网关」**：
 
